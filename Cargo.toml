@@ -1,0 +1,37 @@
+[package]
+name = "btama"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Готовый DX9-оверлей с ImGui: избавляет от собственного хука EndScene.
+hudhook = { version = "0.7", features = ["dx9"] }
+imgui = "0.12"
+minhook-sys = "0.1"
+
+# Перечисляем ровно те фичи, которые используем сами. Раньше часть вызовов
+# (VirtualQuery, GetAsyncKeyState) компилировалась только потому, что нужные
+# фичи включал hudhook, а Cargo их объединял — при смене его версии сборка
+# развалилась бы без единой правки в нашем коде.
+windows = { version = "0.54", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",  # OutputDebugStringW
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",             # VirtualQuery и константы защиты страниц
+    "Win32_System_SystemServices",     # DLL_PROCESS_ATTACH / DETACH
+    "Win32_System_Threading",          # GetCurrentProcessId
+    "Win32_UI_Input_KeyboardAndMouse", # GetAsyncKeyState
+    "Win32_UI_WindowsAndMessaging",    # GetForegroundWindow
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# panic = "abort" здесь недопустим: паника обязана быть перехвачена и
+# залогирована, а не убивать чужой процесс. См. catch_unwind в overlay.rs.
+panic = "unwind"
