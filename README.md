@@ -32,7 +32,7 @@
 cargo build --release
 ```
 
-Результат — `target/i686-pc-windows-msvc/release/BTamaCheat.dll`.
+Результат — `target/i686-pc-windows-msvc/release/btama.dll`.
 
 Тесты (разбор сигнатур, поиск по маске, распаковка цвета, проверка рамок и
 прогон самого ассемблерного детура):
@@ -71,6 +71,7 @@ DLL инжектируется любым инжектором в процесс
 | [`src/offsets.rs`](src/offsets.rs) | смещения полей |
 | [`src/game.rs`](src/game.rs) | разбор игровых объектов |
 | [`src/overlay.rs`](src/overlay.rs) | интерфейс и применение читов |
+| [`src/font.rs`](src/font.rs) | шрифт интерфейса с кириллицей |
 | [`src/log.rs`](src/log.rs) | диагностика |
 
 Каталог [`re/`](re/) — дампы структур из Cheat Engine, источник всех смещений

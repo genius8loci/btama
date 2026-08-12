@@ -17,12 +17,13 @@
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 
-use hudhook::{ImguiRenderLoop, MessageFilter};
-use imgui::{Condition, Drag, ImColor32, Io, StyleColor, Ui, WindowFlags};
+use hudhook::{ImguiRenderLoop, MessageFilter, RenderContext};
+use imgui::{Condition, Context, Drag, ImColor32, Io, StyleColor, Ui, WindowFlags};
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
+use crate::font;
 use crate::game::{self, PlayerView, TrapRef, World};
 use crate::hook;
 use crate::log;
@@ -222,6 +223,12 @@ impl CheatOverlay {
 // ============================================================================
 
 impl ImguiRenderLoop for CheatOverlay {
+    /// Вызывается один раз, до построения текстуры атласа шрифтов, — это
+    /// единственный момент, когда шрифт ещё можно заменить.
+    fn initialize<'a>(&'a mut self, ctx: &mut Context, _render: &'a mut dyn RenderContext) {
+        font::install(ctx);
+    }
+
     fn render(&mut self, ui: &mut Ui) {
         if self.disabled {
             return;
