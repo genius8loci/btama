@@ -8,7 +8,7 @@
 //!   в лог;
 //! * настройки хранятся по `m_UniqueID`, а не по адресу объекта, который
 //!   меняется при каждой сборке мусора;
-//! * меню закрепляется на `INSERT` и на время удержания показывается по
+//! * меню закрепляется на `HOME` и на время удержания показывается по
 //!   `TAB`; пока оно открыто, ввод не доходит до игры (см.
 //!   [`ImguiRenderLoop::message_filter`]);
 //! * ползунки параметров больше не перезаписываются значением из памяти
@@ -30,8 +30,11 @@ use crate::log;
 use crate::offsets::trap;
 
 const VK_TAB: i32 = 0x09;
-const VK_INSERT: i32 = 0x2D;
-const VK_END: i32 = 0x23;
+/// `HOME` — закрепляет меню.
+const VK_HOME: i32 = 0x24;
+/// `PAGE DOWN` — выгружает DLL. В Win32 эта клавиша называется `VK_NEXT`
+/// (0x22), а `VK_PRIOR` — это, наоборот, Page Up.
+const VK_NEXT: i32 = 0x22;
 
 /// Пауза между попытками установить хук, секунды.
 const SCAN_INTERVAL: f32 = 3.0;
@@ -120,26 +123,42 @@ impl View {
 /// состояние, а нам нужны именно нажатия.
 #[derive(Default)]
 struct Keys {
-    insert_down: bool,
-    end_down: bool,
+    toggle_down: bool,
+    eject_down: bool,
+}
+
+/// Что нажато в этом кадре.
+struct Input {
+    /// `HOME` только что нажат — переключить закрепление меню.
+    toggle: bool,
+    /// `TAB` удерживается — показывать меню, пока держат.
+    peek: bool,
+    /// `PAGE DOWN` только что нажат — выгрузить DLL.
+    eject: bool,
 }
 
 impl Keys {
-    /// Возвращает `(insert_pressed, tab_held, end_pressed)`.
-    fn poll(&mut self) -> (bool, bool, bool) {
+    fn poll(&mut self) -> Input {
         if !game_has_focus() {
-            self.insert_down = false;
-            self.end_down = false;
-            return (false, false, false);
+            self.toggle_down = false;
+            self.eject_down = false;
+            return Input {
+                toggle: false,
+                peek: false,
+                eject: false,
+            };
         }
 
-        let insert = key_down(VK_INSERT);
-        let end = key_down(VK_END);
-        let insert_pressed = insert && !self.insert_down;
-        let end_pressed = end && !self.end_down;
-        self.insert_down = insert;
-        self.end_down = end;
-        (insert_pressed, key_down(VK_TAB), end_pressed)
+        let toggle = key_down(VK_HOME);
+        let eject = key_down(VK_NEXT);
+        let input = Input {
+            toggle: toggle && !self.toggle_down,
+            peek: key_down(VK_TAB),
+            eject: eject && !self.eject_down,
+        };
+        self.toggle_down = toggle;
+        self.eject_down = eject;
+        input
     }
 }
 
@@ -262,12 +281,12 @@ impl CheatOverlay {
     fn render_frame(&mut self, ui: &Ui) {
         crate::mem::tick();
 
-        let (insert_pressed, tab_held, end_pressed) = self.keys.poll();
-        if insert_pressed {
+        let input = self.keys.poll();
+        if input.toggle {
             self.menu_pinned = !self.menu_pinned;
         }
-        if end_pressed {
-            log::info!("запрошена выгрузка по END");
+        if input.eject {
+            log::info!("запрошена выгрузка по PAGE DOWN");
             // Выгрузка идёт в отдельном потоке, а рендер продолжает
             // вызываться. Замолкаем сразу, иначе можно обратиться к памяти
             // уже выгружаемой библиотеки.
@@ -279,7 +298,7 @@ impl CheatOverlay {
             hudhook::eject();
             return;
         }
-        self.menu_open = self.menu_pinned || tab_held;
+        self.menu_open = self.menu_pinned || input.peek;
 
         if self.menu_open {
             ui.set_mouse_cursor(Some(imgui::MouseCursor::Arrow));
@@ -348,7 +367,8 @@ impl CheatOverlay {
         if self.show_trap_esp {
             let color = ImColor32::from_rgba(255, 255, 0, 150);
             for item in &self.traps {
-                let Some(rect) = item.rect.filter(game::Rect::is_plausible) else {
+                // Рамка уже проверена на правдоподобность при сборе.
+                let Some(rect) = item.rect else {
                     continue;
                 };
                 let top_left = self.view.to_screen(rect.x as f32, rect.y as f32);
@@ -364,7 +384,7 @@ impl CheatOverlay {
 
         if self.show_esp {
             for player in &world.players {
-                let Some(rect) = player.rect.filter(game::Rect::is_plausible) else {
+                let Some(rect) = player.rect else {
                     continue;
                 };
                 let color = if player.is_local {
@@ -460,14 +480,9 @@ impl CheatOverlay {
             ui.checkbox("Ловушки", &mut self.show_trap_menu);
             ui.same_line();
         }
-        ui.text_colored(
-            MUTED,
-            if self.menu_pinned {
-                "[закреплено]"
-            } else {
-                "[TAB]"
-            },
-        );
+        ui.text_colored(MUTED, if self.menu_pinned { "[HOME]" } else { "[TAB]" });
+
+        self.draw_diagnostics(ui, world);
 
         ui.set_next_item_width(90.0);
         ui.slider("Zoom", 0.1, 3.0, &mut self.view.zoom);
@@ -487,6 +502,27 @@ impl CheatOverlay {
             .build(ui, &mut self.view.camera_y);
 
         ui.separator();
+    }
+
+    /// Показывает сырые счётчики цепочки разбора.
+    ///
+    /// Когда список игроков пуст, по одной строке видно, где именно рвётся
+    /// цепочка: хук не приносит объектов, не опознан класс, или не нашёлся
+    /// объект с `isLocal == 1`.
+    fn draw_diagnostics(&self, ui: &Ui, world: &World) {
+        let class = match game::player_class() {
+            Some(class) => format!("0x{class:X}"),
+            None => "не опознан".to_string(),
+        };
+        ui.text_colored(
+            MUTED,
+            format!(
+                "объектов: {} | класс: {class} | экран: 0x{:X} | ловушек: {}",
+                self.objects.len(),
+                world.screen,
+                self.traps.len()
+            ),
+        );
     }
 
     fn draw_player_row(&mut self, ui: &Ui, player: &PlayerView) {

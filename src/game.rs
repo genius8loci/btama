@@ -154,26 +154,42 @@ fn is_local(addr: usize) -> bool {
     mem::read::<u8>(addr + player::IS_LOCAL) == Some(1)
 }
 
-/// Определяет таблицу методов класса `Player` по самопроверяющемуся признаку.
+/// Признаки игрока, проверяемые не выходя за пределы самого объекта.
 ///
-/// Кандидат обязан объявить себя локальным игроком, дать читаемый
-/// `GameplayScreen` и найтись в его списке игроков. Совпадение всех трёх
-/// условий на случайном мусоре практически исключено.
+/// Прежняя версия требовала вдобавок, чтобы кандидат нашёлся в списке игроков
+/// своего `GameplayScreen`. Проверка выглядела убедительно, но опиралась на
+/// раскладку экрана из дампа **онлайновой** сессии. В одиночной игре класс
+/// экрана другой, `screen + 0x100` списком игроков не является, цепочка
+/// рвалась — и класс не определялся никогда. А без класса переставали
+/// работать разом и список игроков, и ESP.
+fn looks_like_player(addr: usize) -> bool {
+    if !mem::is_readable(addr, player::PROBE_SIZE) {
+        return false;
+    }
+    // isLocal — булев флаг; любое другое значение означает, что по этому
+    // адресу лежит не игрок.
+    if !matches!(mem::read::<u8>(addr + player::IS_LOCAL), Some(0 | 1)) {
+        return false;
+    }
+    // GameplayScreen — обязательная ссылка на другой managed-объект.
+    let Some(screen_addr) = mem::read_ptr(addr + player::GAMEPLAY_SCREEN) else {
+        return false;
+    };
+    if !mem::is_readable(screen_addr, PTR_SIZE) {
+        return false;
+    }
+    // m_BoundingRect обязан выглядеть настоящей рамкой.
+    Rect::read(addr + player::BOUNDING_RECT).is_some_and(|rect| rect.is_plausible())
+}
+
+/// Определяет таблицу методов класса `Player`.
+///
+/// Эталон берётся с объекта, объявившего себя локальным игроком: такой в
+/// сессии ровно один, а остальные проверки в [`looks_like_player`] отсеивают
+/// случайный мусор, у которого байт по 0x152 тоже оказался нулём или единицей.
 fn bootstrap(objects: &[usize]) {
     for &addr in objects {
-        if !mem::is_readable(addr, player::PROBE_SIZE) || !is_local(addr) {
-            continue;
-        }
-        let Some(screen_addr) = mem::read_ptr(addr + player::GAMEPLAY_SCREEN) else {
-            continue;
-        };
-        if !mem::is_readable(screen_addr, screen::PROBE_SIZE) {
-            continue;
-        }
-        let Some(list_addr) = mem::read_ptr(screen_addr + screen::PLAYERS) else {
-            continue;
-        };
-        if !read_list(list_addr, MAX_PLAYERS).contains(&addr) {
+        if !looks_like_player(addr) || !is_local(addr) {
             continue;
         }
         let Some(class) = mem::read_ptr(addr + METHOD_TABLE) else {
@@ -229,9 +245,26 @@ fn read_player(addr: usize) -> Option<PlayerView> {
             .unwrap_or_default(),
         color: unpack_color(mem::read::<u32>(addr + player::COLOR)?),
         position: (x, y),
-        rect: Rect::read(addr + player::BOUNDING_RECT),
+        rect: Rect::read(addr + player::BOUNDING_RECT).filter(Rect::is_plausible),
         is_local: is_local(addr),
     })
+}
+
+/// Отбирает игроков из списка адресов: отсеивает чужие объекты, убирает
+/// дубликаты (хук приносит один объект по нескольку раз за кадр) и ставит
+/// локального первым — на этот порядок опирается интерфейс.
+fn collect_players(addresses: &[usize]) -> Vec<PlayerView> {
+    let mut unique: Vec<usize> = addresses
+        .iter()
+        .copied()
+        .filter(|&addr| is_player(addr))
+        .collect();
+    unique.sort_unstable();
+    unique.dedup();
+
+    let mut players: Vec<PlayerView> = unique.into_iter().filter_map(read_player).collect();
+    players.sort_by_key(|player| if player.is_local { 0 } else { 1 });
+    players
 }
 
 /// Строит снимок мира из указателей, собранных хуком за кадр.
@@ -246,39 +279,35 @@ pub fn build_world(objects: &[usize]) -> World {
         return world;
     };
 
-    let Some(screen_addr) = mem::read_ptr(local_addr + player::GAMEPLAY_SCREEN) else {
-        return world;
+    // Экран нужен для списков игроков и ловушек. Проверяем его только на
+    // читаемость указателя: требовать целиком `screen::PROBE_SIZE` нельзя —
+    // в одиночной игре класс экрана другой и может быть короче.
+    world.screen = mem::read_ptr(local_addr + player::GAMEPLAY_SCREEN)
+        .filter(|&screen_addr| mem::is_readable(screen_addr, PTR_SIZE))
+        .unwrap_or(0);
+
+    // Список игроков экрана полнее буфера хука: в нём есть и те, кто в этом
+    // кадре не двигался. Но его смещение снято с онлайновой сессии, поэтому
+    // результат обязательно проверяется, а при неудаче берётся буфер хука —
+    // именно так работала последняя версия, у которой ESP не отваливался.
+    world.players = players_from_screen(world.screen);
+    if world.players.is_empty() {
+        world.players = collect_players(objects);
+    }
+
+    world
+}
+
+/// Читает список игроков из `GameplayScreen`. Пустой результат означает, что
+/// смещение для этого режима игры не подходит.
+fn players_from_screen(screen_addr: usize) -> Vec<PlayerView> {
+    if screen_addr == 0 {
+        return Vec::new();
+    }
+    let Some(list_addr) = mem::read_ptr(screen_addr + screen::PLAYERS) else {
+        return Vec::new();
     };
-    if !mem::is_readable(screen_addr, screen::PROBE_SIZE) {
-        return world;
-    }
-    world.screen = screen_addr;
-
-    // Основной источник — список игроков экрана: он содержит и тех, кто в
-    // этом кадре не двигался и потому не попал в буфер хука.
-    let mut addresses = mem::read_ptr(screen_addr + screen::PLAYERS)
-        .map(|list_addr| read_list(list_addr, MAX_PLAYERS))
-        .unwrap_or_default();
-
-    // Запасной вариант — буфер хука. В отличие от прежней версии он отфильтрован
-    // по классу, поэтому посторонние объекты в ESP больше не попадают.
-    if addresses.is_empty() {
-        addresses = objects.to_vec();
-    }
-    addresses.sort_unstable();
-    addresses.dedup();
-
-    world.players = addresses
-        .into_iter()
-        .filter(|&addr| is_player(addr))
-        .filter_map(read_player)
-        .collect();
-
-    // Локальный игрок — первым: интерфейс на это опирается.
-    world
-        .players
-        .sort_by_key(|player| if player.is_local { 0 } else { 1 });
-    world
+    collect_players(&read_list(list_addr, MAX_PLAYERS))
 }
 
 // ============================================================================
@@ -363,9 +392,12 @@ pub fn collect_traps(screen_addr: usize, out: &mut Vec<TrapRef>) {
         out.push(TrapRef {
             addr,
             class,
-            // Единственная рамка, лежащая по одному адресу и у `Trap`,
-            // и у его наследников.
-            rect: Rect::read(addr + trap::BOUNDING),
+            // `m_Rectangle` — то, чем пользовалась последняя версия с
+            // работающим ESP ловушек; `m_Bounding` остаётся запасным.
+            // Оба поля лежат по одному адресу и у `Trap`, и у наследников.
+            rect: Rect::read(addr + trap::RECTANGLE)
+                .filter(Rect::is_plausible)
+                .or_else(|| Rect::read(addr + trap::BOUNDING).filter(Rect::is_plausible)),
         });
     }
 }

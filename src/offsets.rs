@@ -79,13 +79,19 @@ pub mod player {
 }
 
 /// `Bloody_Trapland.Screens.OnlineGameplayScreen`.
+///
+/// # Осторожно
+///
+/// Дампы в `re/` сняты с **онлайновой** сессии. В одиночной игре класс экрана
+/// другой, и эти смещения могут не значить ничего. Поэтому оба списка ниже —
+/// не более чем подсказка: результат обязательно проверяется, а при неудаче
+/// код обходится буфером хука. Общего `PROBE_SIZE` для экрана намеренно нет —
+/// требовать читаемости всех 0x104 байт нельзя, экран может быть короче.
 pub mod screen {
     /// `TrapList` — `List<Trap>`.
     pub const TRAP_LIST: usize = 0x34;
     /// `m_Players` — `List<Player>`.
     pub const PLAYERS: usize = 0x100;
-
-    pub const PROBE_SIZE: usize = PLAYERS + super::PTR_SIZE;
 }
 
 /// `Bloody_Trapland.WorldObjects.Trap` и его наследники.
@@ -110,8 +116,13 @@ pub mod trap {
     pub const UPDATEABLE: usize = 0x45;
     /// `GoreStick` (u8).
     pub const GORE_STICK: usize = 0x46;
-    /// `m_Bounding` (4 × i32) — есть и у `Trap`, и у `BoomTrap` по одному
-    /// адресу, поэтому это единственный корректный источник рамки для ESP.
+    /// `m_Rectangle` (4 × i32) — основной источник рамки для ESP.
+    ///
+    /// Именно это смещение использовала последняя версия, у которой ESP
+    /// ловушек работал. Присутствует и у `Trap`, и у `BoomTrap`.
+    pub const RECTANGLE: usize = 0x70;
+    /// `m_Bounding` (4 × i32) — запасной источник рамки, тоже общий для
+    /// `Trap` и `BoomTrap`.
     pub const BOUNDING: usize = 0x50;
 
     /// `Speed` (f32) — **только** у `BoomTrap`-подобных классов.
@@ -120,7 +131,7 @@ pub mod trap {
     pub const BOOM_CAN_TRIGGER: usize = 0xAC;
 
     /// Достаточно для полей, общих для всех ловушек.
-    pub const PROBE_SIZE: usize = BOUNDING + 4 * 4;
+    pub const PROBE_SIZE: usize = RECTANGLE + 4 * 4;
     /// Достаточно для полей `BoomTrap`.
     pub const BOOM_PROBE_SIZE: usize = BOOM_CAN_TRIGGER + 1;
 }
