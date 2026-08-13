@@ -659,35 +659,93 @@ fn read_vector2(addr: usize) -> Option<(f32, f32)> {
     (x.is_finite() && y.is_finite()).then_some((x, y))
 }
 
+/// Во сколько раз единица физического движка крупнее пикселя мира.
+///
+/// Игра хранит положение объекта дважды: `m_Bounding` (0x50) — в пикселях,
+/// `Position` (0x88) — в единицах симуляции. Farseer по умолчанию берёт
+/// 100 пикселей на единицу, и снятые с игры пары это подтверждают:
+/// `144,576` против `1.44,5.76` и `1488,576` против `14.88,5.76`.
+///
+/// Константа всё же только запасная: масштаб выводится из самих данных
+/// (см. [`derive_sim_scale`]), потому что подставлять сюда неверное число
+/// значит промахнуться рамками ровно во столько же раз.
+const SIM_TO_DISPLAY_DEFAULT: f32 = 100.0;
+
+/// Правдоподобные границы выведенного масштаба. Всё за их пределами
+/// означает, что мы поделили одно случайное число на другое.
+const SIM_TO_DISPLAY_RANGE: std::ops::RangeInclusive<f32> = 1.0..=1000.0;
+
+/// Выводит масштаб симуляции по объектам, у которых заполнены обе позиции.
+///
+/// Такие в списке есть всегда: элементы самого уровня (`Object_World*`)
+/// несут и `m_Bounding` в пикселях, и `Position` в единицах движка.
+fn derive_sim_scale(traps: &[TrapRef]) -> f32 {
+    for item in traps {
+        let Some(bounding) = item
+            .bounding_raw
+            .filter(|rect| rect.is_plausible_within(MAX_TRAP_DIMENSION))
+        else {
+            continue;
+        };
+        let Some((sim_x, sim_y)) = item.position_alt else {
+            continue;
+        };
+        // Берём ту ось, где число крупнее: у координаты, близкой к нулю,
+        // относительная погрешность выше.
+        let (display, sim) = if sim_x.abs() >= sim_y.abs() {
+            (bounding.x as f32, sim_x)
+        } else {
+            (bounding.y as f32, sim_y)
+        };
+        if sim.abs() < 0.01 {
+            continue;
+        }
+        let scale = display / sim;
+        if SIM_TO_DISPLAY_RANGE.contains(&scale) {
+            return scale;
+        }
+    }
+    SIM_TO_DISPLAY_DEFAULT
+}
+
 /// Выбирает мировую рамку объекта.
 ///
 /// Порядок именно такой, потому что источники неравноценны:
 ///
-/// 1. `m_Bounding` (0x50) — готовый прямоугольник коллизии в мировых
-///    координатах. Точнее всех, но у части объектов остаётся нулевым;
-/// 2. позиция (0x24) плюс размер кадра (0x70). Позицию игра заполняет у
-///    всех объектов из данных уровня, а размер кадра совпадает с размером
-///    объекта в мире — тайлы 48×48 и 48×96 это подтверждают;
-/// 3. вторая позиция (0x88) с тем же размером — на случай, если первая у
-///    этого класса не используется.
+/// 1. `m_Bounding` (0x50) — готовый прямоугольник коллизии прямо в пикселях
+///    мира. Точнее всех, но заполнен только у элементов уровня; у собственно
+///    ловушек остаётся нулевым;
+/// 2. `Position` (0x88), переведённая из единиц симуляции, плюс размер кадра
+///    (0x70). Размер кадра совпадает с размером объекта в мире — тайлы 48×48
+///    и 48×96 это подтверждают;
+/// 3. `PositionX`/`PositionY` (0x24) с тем же размером. В снятой сборке эта
+///    пара везде нулевая, но она есть в раскладке и ничего не стоит.
 ///
 /// Обратите внимание, чего в списке нет: самого `m_Rectangle` как рамки.
 /// Прежняя версия ставила его первым, а это координаты в атласе текстур —
-/// отсюда и кучка рамок в углу экрана вместо ESP.
+/// отсюда и рамки кучей в углу экрана вместо ESP.
+///
+/// Нулевую позицию мы пропускаем. Объект ровно в начале координат из-за
+/// этого рамку потеряет, но такой объект и так несёт `m_Bounding` и будет
+/// пойман первым правилом, а вот незаполненное поле нулём притворяется
+/// постоянно — и именно оно собирало рамки в левом верхнем углу.
 fn world_rect(
     bounding: Option<Rect>,
     source: Option<Rect>,
     position: Option<(f32, f32)>,
     position_alt: Option<(f32, f32)>,
+    sim_scale: f32,
 ) -> Option<RectF> {
     if let Some(rect) = bounding.filter(|rect| rect.is_plausible_within(MAX_TRAP_DIMENSION)) {
         return Some(rect.into());
     }
 
     let size = source.filter(|rect| rect.is_plausible_within(MAX_TRAP_DIMENSION))?;
-    let (x, y) = position
-        .filter(|&(x, y)| x != 0.0 || y != 0.0)
-        .or(position_alt)?;
+    let non_zero = |&(x, y): &(f32, f32)| x != 0.0 || y != 0.0;
+    let (x, y) = match position_alt.filter(non_zero) {
+        Some((sim_x, sim_y)) => (sim_x * sim_scale, sim_y * sim_scale),
+        None => position.filter(non_zero)?,
+    };
     Some(RectF {
         x,
         y,
@@ -696,11 +754,15 @@ fn world_rect(
     })
 }
 
-/// Собирает ловушки уровня.
-pub fn collect_traps(screen_addr: usize, out: &mut Vec<TrapRef>) {
+/// Собирает ловушки уровня и возвращает применённый масштаб симуляции.
+///
+/// Проход по списку двойной: масштаб выводится из тех объектов, у которых
+/// заполнены обе позиции, а применять его нужно ко всем — включая те, что
+/// встретились раньше донора.
+pub fn collect_traps(screen_addr: usize, out: &mut Vec<TrapRef>) -> f32 {
     out.clear();
     let Some(list_addr) = mem::read_ptr(screen_addr + screen::TRAP_LIST) else {
-        return;
+        return SIM_TO_DISPLAY_DEFAULT;
     };
 
     for addr in read_list(list_addr, MAX_TRAPS) {
@@ -712,20 +774,28 @@ pub fn collect_traps(screen_addr: usize, out: &mut Vec<TrapRef>) {
         };
         // Все источники сохраняются сырыми: интерфейс показывает их по
         // галочке «Показать рамки», и по ним видно, откуда взялась рамка.
-        let bounding_raw = Rect::read(addr + trap::BOUNDING);
-        let source_raw = Rect::read(addr + trap::SOURCE_RECT);
-        let position = read_vector2(addr + trap::POSITION_X);
-        let position_alt = read_vector2(addr + trap::POSITION);
         out.push(TrapRef {
             addr,
             class,
-            rect: world_rect(bounding_raw, source_raw, position, position_alt),
-            bounding_raw,
-            source_raw,
-            position,
-            position_alt,
+            rect: None,
+            bounding_raw: Rect::read(addr + trap::BOUNDING),
+            source_raw: Rect::read(addr + trap::SOURCE_RECT),
+            position: read_vector2(addr + trap::POSITION_X),
+            position_alt: read_vector2(addr + trap::POSITION),
         });
     }
+
+    let sim_scale = derive_sim_scale(out);
+    for item in out.iter_mut() {
+        item.rect = world_rect(
+            item.bounding_raw,
+            item.source_raw,
+            item.position,
+            item.position_alt,
+            sim_scale,
+        );
+    }
+    sim_scale
 }
 
 pub fn trap_name(addr: usize) -> Option<String> {
@@ -808,23 +878,40 @@ mod tests {
         assert!(rect.is_plausible_within(MAX_TRAP_DIMENSION));
     }
 
-    /// Числа сняты с живой игры: строка `Object_World5` в списке ловушек.
+    /// Строка `Object_World5` из списка ловушек живой игры.
+    fn object_world5() -> TrapRef {
+        TrapRef {
+            addr: 0x2000,
+            class: 0x2387_6C30,
+            rect: None,
+            bounding_raw: Some(Rect {
+                x: 144,
+                y: 576,
+                w: 48,
+                h: 48,
+            }),
+            // m_Rectangle: кадр в атласе, y всегда 0.
+            source_raw: Some(Rect {
+                x: 192,
+                y: 0,
+                w: 48,
+                h: 48,
+            }),
+            position: Some((0.0, 0.0)),
+            position_alt: Some((1.44, 5.76)),
+        }
+    }
+
     #[test]
     fn world_bounding_wins_over_the_texture_frame() {
-        let bounding = Rect {
-            x: 144,
-            y: 576,
-            w: 48,
-            h: 48,
-        };
-        // m_Rectangle этого же объекта: кадр в атласе, y всегда 0.
-        let source = Rect {
-            x: 192,
-            y: 0,
-            w: 48,
-            h: 48,
-        };
-        let rect = world_rect(Some(bounding), Some(source), Some((144.0, 576.0)), None);
+        let item = object_world5();
+        let rect = world_rect(
+            item.bounding_raw,
+            item.source_raw,
+            item.position,
+            item.position_alt,
+            100.0,
+        );
         assert_eq!(
             rect,
             Some(RectF {
@@ -836,11 +923,28 @@ mod tests {
         );
     }
 
-    /// Числа сняты с живой игры: строка `Traps_SemiMedium2`, у которой
-    /// `m_Bounding` пуст. Рамку приходится собирать из позиции и размера
-    /// кадра — и ни в коем случае не из координат кадра.
+    /// Масштаб симуляции обязан выводиться из данных, а не браться на веру:
+    /// ошибка в нём промахивается рамками во столько же раз.
     #[test]
-    fn empty_bounding_falls_back_to_position_and_frame_size() {
+    fn sim_scale_comes_from_objects_that_carry_both_positions() {
+        let scale = derive_sim_scale(&[object_world5()]);
+        assert!((scale - 100.0).abs() < 0.1, "получили {scale}");
+    }
+
+    #[test]
+    fn sim_scale_falls_back_when_nothing_carries_both() {
+        let mut lonely = object_world5();
+        lonely.bounding_raw = None;
+        assert_eq!(derive_sim_scale(&[lonely]), SIM_TO_DISPLAY_DEFAULT);
+    }
+
+    /// Строка `Traps_SemiMedium2`: `m_Bounding` пуст, `PositionX` нулевая,
+    /// и единственная зацепка — позиция в единицах симуляции.
+    ///
+    /// Регрессия: раньше эти единицы принимались за пиксели, и все такие
+    /// ловушки собирались рамками в левом верхнем углу экрана.
+    #[test]
+    fn simulation_units_are_converted_to_pixels() {
         let empty = Rect {
             x: 0,
             y: 0,
@@ -853,27 +957,36 @@ mod tests {
             w: 48,
             h: 96,
         };
-        let rect = world_rect(Some(empty), Some(source), Some((816.0, 480.0)), None);
-        assert_eq!(
-            rect,
-            Some(RectF {
-                x: 816.0,
-                y: 480.0,
-                w: 48.0,
-                h: 96.0
-            })
-        );
+        let rect = world_rect(
+            Some(empty),
+            Some(source),
+            Some((0.0, 0.0)),
+            Some((8.16, 4.8)),
+            100.0,
+        )
+        .expect("рамка должна собраться из единиц симуляции");
+        // Точного равенства тут не бывает: 4.8 в двоичном виде не
+        // представима, и после умножения выходит 480.00003.
+        assert!((rect.x - 816.0).abs() < 0.01, "получили {}", rect.x);
+        assert!((rect.y - 480.0).abs() < 0.01, "получили {}", rect.y);
+        assert_eq!((rect.w, rect.h), (48.0, 96.0));
     }
 
     #[test]
-    fn zero_position_defers_to_the_second_one() {
+    fn zero_simulation_position_defers_to_the_pixel_one() {
         let source = Rect {
             x: 0,
             y: 0,
             w: 48,
             h: 48,
         };
-        let rect = world_rect(None, Some(source), Some((0.0, 0.0)), Some((240.0, 96.0)));
+        let rect = world_rect(
+            None,
+            Some(source),
+            Some((240.0, 96.0)),
+            Some((0.0, 0.0)),
+            100.0,
+        );
         assert_eq!(rect.map(|rect| (rect.x, rect.y)), Some((240.0, 96.0)));
     }
 
@@ -885,7 +998,16 @@ mod tests {
             w: 48,
             h: 48,
         };
-        assert_eq!(world_rect(None, Some(source), None, None), None);
+        assert_eq!(
+            world_rect(
+                None,
+                Some(source),
+                Some((0.0, 0.0)),
+                Some((0.0, 0.0)),
+                100.0
+            ),
+            None
+        );
     }
 
     #[test]

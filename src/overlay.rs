@@ -246,6 +246,9 @@ pub struct CheatOverlay {
     /// Пересчитывается в начале каждого кадра, поэтому обе стороны
     /// заведомо согласованы между собой.
     transform: Affine,
+    /// Сколько пикселей мира в единице физического движка — выведено из
+    /// самих ловушек, показывается в их окне.
+    sim_scale: f32,
     scan_timer: f32,
 
     menu_pinned: bool,
@@ -272,6 +275,7 @@ impl Default for CheatOverlay {
             view: View::default(),
             camera: None,
             transform: View::default().manual_transform(),
+            sim_scale: 0.0,
             scan_timer: 0.0,
             menu_pinned: false,
             menu_open: false,
@@ -378,7 +382,7 @@ impl CheatOverlay {
 
         // Ловушки читаются только когда действительно нужны.
         if world.screen != 0 && (self.show_trap_esp || self.show_trap_menu) {
-            game::collect_traps(world.screen, &mut self.traps);
+            self.sim_scale = game::collect_traps(world.screen, &mut self.traps);
         } else {
             self.traps.clear();
         }
@@ -797,25 +801,37 @@ impl CheatOverlay {
     fn draw_trap_window(&mut self, ui: &Ui) {
         let _bg = ui.push_style_color(StyleColor::WindowBg, [0.05, 0.05, 0.05, 0.9]);
         let _border = ui.push_style_color(StyleColor::Border, ACCENT);
+        // Заголовок переехал в шапку окна — к стрелке сворачивания, — поэтому
+        // саму шапку надо покрасить: по умолчанию она синяя и с остальным
+        // оформлением не сочетается.
+        let _title = ui.push_style_color(StyleColor::TitleBg, [0.08, 0.05, 0.11, 0.95]);
+        let _title_active =
+            ui.push_style_color(StyleColor::TitleBgActive, [0.12, 0.08, 0.17, 0.95]);
 
-        ui.window("##TrapManager")
+        // Текст до `##` — видимая часть заголовка, после — идентификатор
+        // окна: он обязан пережить переименование, иначе ImGui забудет
+        // положение и размер окна.
+        ui.window("Менеджер Ловушек##TrapManager")
             .position([520.0, 20.0], Condition::FirstUseEver)
             .size([520.0, 460.0], Condition::FirstUseEver)
             .build(|| {
-                ui.text_colored(ACCENT, "=== TRAP MANAGER ===");
                 ui.checkbox("Рисовать ESP ловушек", &mut self.show_trap_esp);
                 ui.same_line();
                 ui.checkbox("Показать рамки", &mut self.show_trap_rects);
                 if ui.is_item_hovered() {
                     ui.tooltip_text(
                         "Сырые источники рамки по каждой ловушке:\n\
-                         поз — PositionX/PositionY (0x24), мировая позиция;\n\
-                         0x50 — m_Bounding, коллизия в мировых координатах;\n\
+                         поз — PositionX/PositionY (0x24), в этой сборке всегда 0;\n\
+                         0x50 — m_Bounding, коллизия в пикселях мира;\n\
                          0x70 — m_Rectangle, кадр в атласе текстур (не мир!);\n\
-                         0x88 — вторая мировая позиция.",
+                         0x88 — Position в единицах физического движка.",
                     );
                 }
-                ui.text(format!("Всего ловушек: {}", self.traps.len()));
+                ui.text(format!(
+                    "Всего ловушек: {} | единица симуляции = {:.1} px",
+                    self.traps.len(),
+                    self.sim_scale
+                ));
                 let with_rect = self.traps.iter().filter(|item| item.rect.is_some()).count();
                 if with_rect != self.traps.len() {
                     ui.text_colored(
