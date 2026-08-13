@@ -106,17 +106,18 @@ pub mod screen {
     pub const REMOTE_PLAYER_LIST: usize = 0x40;
     /// `MergedPlayerList` — `List<Player>`, объединение двух предыдущих.
     pub const MERGED_PLAYER_LIST: usize = 0x44;
-    /// `camera` — указатель на объект камеры.
-    ///
-    /// Раскладка самого объекта пока не снята, поэтому перевод мировых
-    /// координат в экранные до сих пор делается вручную ползунками. Как
-    /// только появится дамп — подставлять смещения нужно сюда.
+    /// `camera` — указатель на `TwoPlayGame.Cameras.Camera`.
+    /// Раскладку см. в [`super::camera`].
     pub const CAMERA: usize = 0x4C;
     /// `m_Online` (u8) — сетевая ли сессия.
     pub const IS_ONLINE: usize = 0xD1;
 }
 
 /// `Bloody_Trapland.WorldObjects.Trap` и его наследники.
+///
+/// Всё до 0x90 принадлежит общему предку `TwoPlayGame.GameWorld.WorldObject`
+/// и потому одинаково у `Trap`, `BoomTrap`, `QuickGoal` и прочих элементов
+/// списка ловушек.
 ///
 /// # Почему 0xA4 и 0xAC вынесены отдельно
 ///
@@ -132,20 +133,35 @@ pub mod screen {
 pub mod trap {
     /// `<Name>k__BackingField` — указатель на `System.String`.
     pub const NAME: usize = 0x20;
+    /// `<PositionX>k__BackingField` и `<PositionY>k__BackingField` (2 × f32) —
+    /// мировая позиция объекта, левый верхний угол.
+    pub const POSITION_X: usize = 0x24;
     /// `Used` (u8).
     pub const USED: usize = 0x44;
     /// `Updateable` (u8).
     pub const UPDATEABLE: usize = 0x45;
     /// `GoreStick` (u8).
     pub const GORE_STICK: usize = 0x46;
-    /// `m_Rectangle` (4 × i32) — основной источник рамки для ESP.
-    ///
-    /// Именно это смещение использовала последняя версия, у которой ESP
-    /// ловушек работал. Присутствует и у `Trap`, и у `BoomTrap`.
-    pub const RECTANGLE: usize = 0x70;
-    /// `m_Bounding` (4 × i32) — запасной источник рамки, тоже общий для
-    /// `Trap` и `BoomTrap`.
+    /// `m_Bounding` (4 × i32) — прямоугольник коллизии **в мировых
+    /// координатах**. Единственный источник рамки, который годится для ESP
+    /// как есть, но заполнен не у всех объектов: у собственно ловушек он
+    /// нередко остаётся нулевым, и тогда рамку приходится собирать из
+    /// [`POSITION_X`] и размера [`SOURCE_RECT`].
     pub const BOUNDING: usize = 0x50;
+    /// `m_Rectangle` (4 × i32) — **кадр в атласе текстур**, а не положение
+    /// в мире.
+    ///
+    /// Здесь и была причина того, что ESP ловушек рисовался кучей в углу
+    /// экрана: прежняя версия считала это поле основным источником рамки.
+    /// Снятые с игры числа не оставляют сомнений — у всех объектов `y = 0`,
+    /// а `x` кратен 48 (`96,0 48x48`, `48,0 48x96`, `192,0 48x48`), то есть
+    /// это раскладка спрайтов в текстуре. Полезен из него только размер:
+    /// он совпадает с размером объекта в мире.
+    pub const SOURCE_RECT: usize = 0x70;
+    /// `<Position>k__BackingField` (2 × f32) — ещё одна мировая позиция,
+    /// параллельная [`POSITION_X`]. Какая из двух движется у подвижных
+    /// ловушек, по дампу не видно, поэтому обе показываются в интерфейсе.
+    pub const POSITION: usize = 0x88;
 
     /// `Speed` (f32) — **только** у `BoomTrap`-подобных классов.
     pub const BOOM_SPEED: usize = 0xA4;
@@ -153,9 +169,40 @@ pub mod trap {
     pub const BOOM_CAN_TRIGGER: usize = 0xAC;
 
     /// Достаточно для полей, общих для всех ловушек.
-    pub const PROBE_SIZE: usize = RECTANGLE + 4 * 4;
+    pub const PROBE_SIZE: usize = POSITION + 2 * 4;
     /// Достаточно для полей `BoomTrap`.
     pub const BOOM_PROBE_SIZE: usize = BOOM_CAN_TRIGGER + 1;
+}
+
+/// `TwoPlayGame.Cameras.Camera` — то, чем игра переводит мир в экран.
+///
+/// Наследование: `Camera` → `BaseCamera` → `BaseObject` → `CoreObject`.
+///
+/// С 0x30 начинается сплошная лента матриц 4×4 по 64 байта: `Viewprojection`
+/// (0x30), `m_Projection` (0x70), `m_SimProjection` (0xB0), `m_Transform`
+/// (0xF0), `m_InvertTransform` (0x130), `m_InvertScalelessTransform` (0x170).
+/// Из них нам нужна ровно одна, остальные перечислены, чтобы соседние
+/// смещения не выглядели произвольными. `m_Rotation` (0x24) здесь тоже нет:
+/// поворот уже сведён в матрицу.
+pub mod camera {
+    /// `m_Zoom` (f32).
+    pub const ZOOM: usize = 0x20;
+    /// `ViewportWidth` (i32).
+    pub const VIEWPORT_WIDTH: usize = 0x28;
+    /// `ViewportHeight` (i32).
+    pub const VIEWPORT_HEIGHT: usize = 0x2C;
+    /// `m_Transform` (`Matrix`, 16 × f32, построчно) — ровно то, что игра
+    /// отдаёт в `SpriteBatch.Begin`. Берём её целиком, а не собираем
+    /// преобразование из зума и позиции: масштаб, поворот и центрирование
+    /// вьюпорта уже сведены здесь в шесть чисел.
+    pub const TRANSFORM: usize = 0xF0;
+    /// `m_CameraPosition` (2 × f32).
+    pub const CAMERA_POSITION: usize = 0x1D8;
+    /// `RealPosition` (2 × f32).
+    pub const REAL_POSITION: usize = 0x1E0;
+
+    /// Сколько байт камеры должно читаться, прежде чем трогать её поля.
+    pub const PROBE_SIZE: usize = REAL_POSITION + 2 * 4;
 }
 
 /// Указатель на таблицу методов (в дампах Cheat Engine — «Vtable») лежит по

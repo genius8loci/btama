@@ -21,7 +21,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::mem;
-use crate::offsets::{METHOD_TABLE, MIN_VALID_ADDRESS, PTR_SIZE, list, player, screen, trap};
+use crate::offsets::{
+    METHOD_TABLE, MIN_VALID_ADDRESS, PTR_SIZE, camera as camera_fields, list, player, screen, trap,
+};
 
 /// Верхняя граница разумного размера рамки игрока в игровых единицах.
 const MAX_DIMENSION: i32 = 2000;
@@ -77,6 +79,29 @@ impl Rect {
     /// То же, но с собственным пределом размера.
     pub fn is_plausible_within(&self, max_dimension: i32) -> bool {
         self.w > 0 && self.h > 0 && self.w <= max_dimension && self.h <= max_dimension
+    }
+}
+
+/// Рамка в мировых координатах.
+///
+/// Вещественная, а не целая, как [`Rect`]: у подвижных объектов положение
+/// задаётся парой `f32`, и округление до целых заставляло бы рамку дёргаться.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RectF {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl From<Rect> for RectF {
+    fn from(rect: Rect) -> Self {
+        Self {
+            x: rect.x as f32,
+            y: rect.y as f32,
+            w: rect.w as f32,
+            h: rect.h as f32,
+        }
     }
 }
 
@@ -365,13 +390,188 @@ pub fn is_online(screen_addr: usize) -> Option<bool> {
     mem::read::<u8>(screen_addr + screen::IS_ONLINE).map(|value| value != 0)
 }
 
-/// Указатель на объект камеры. Пока используется только для диагностики:
-/// раскладка самой камеры не снята.
+/// Указатель на объект камеры.
 pub fn camera(screen_addr: usize) -> Option<usize> {
     if screen_addr == 0 {
         return None;
     }
     mem::read_ptr(screen_addr + screen::CAMERA).filter(|&addr| addr >= MIN_VALID_ADDRESS)
+}
+
+// ============================================================================
+// КАМЕРА
+// ============================================================================
+
+/// Аффинное преобразование плоскости: матрица 2×2 и перенос.
+///
+/// XNA хранит `Matrix` построчно, а `Vector2.Transform` берёт из шестнадцати
+/// её чисел ровно шесть: `M11, M12, M21, M22, M41, M42`. Остальные описывают
+/// третье измерение, которого у двумерной игры нет.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Affine {
+    pub m11: f32,
+    pub m12: f32,
+    pub m21: f32,
+    pub m22: f32,
+    pub m41: f32,
+    pub m42: f32,
+}
+
+impl Affine {
+    /// Масштаб вокруг заданной точки — то, что раньше делали ползунки
+    /// `Zoom`, `Cam X` и `Cam Y`.
+    pub fn from_zoom_and_offset(zoom: f32, camera_x: f32, camera_y: f32) -> Self {
+        Self {
+            m11: zoom,
+            m12: 0.0,
+            m21: 0.0,
+            m22: zoom,
+            m41: -camera_x * zoom,
+            m42: -camera_y * zoom,
+        }
+    }
+
+    /// Читает `Matrix` XNA по адресу и оставляет от неё двумерную часть.
+    fn read(addr: usize) -> Option<Self> {
+        let m = mem::read::<[f32; 16]>(addr)?;
+        Some(Self {
+            m11: m[0],
+            m12: m[1],
+            m21: m[4],
+            m22: m[5],
+            m41: m[12],
+            m42: m[13],
+        })
+    }
+
+    pub fn determinant(self) -> f32 {
+        self.m11 * self.m22 - self.m12 * self.m21
+    }
+
+    /// Годится ли преобразование для рисования.
+    ///
+    /// Вырожденную матрицу нужно отсечь до, а не после употребления: она
+    /// схлопнула бы весь мир в точку, а обратное преобразование (телепорт)
+    /// дало бы бесконечность.
+    pub fn is_usable(self) -> bool {
+        let finite = [self.m11, self.m12, self.m21, self.m22, self.m41, self.m42]
+            .iter()
+            .all(|value| value.is_finite());
+        let scale = self.determinant().abs();
+        finite && (1e-6..1e12).contains(&scale)
+    }
+
+    pub fn to_screen(self, x: f32, y: f32) -> [f32; 2] {
+        [
+            x * self.m11 + y * self.m21 + self.m41,
+            x * self.m12 + y * self.m22 + self.m42,
+        ]
+    }
+
+    /// Обратное преобразование — нужно телепорту, который получает точку
+    /// в экранных координатах курсора.
+    pub fn to_world(self, x: f32, y: f32) -> (f32, f32) {
+        let det = self.determinant();
+        if det.abs() < f32::EPSILON {
+            return (x, y);
+        }
+        let dx = x - self.m41;
+        let dy = y - self.m42;
+        (
+            (dx * self.m22 - dy * self.m21) / det,
+            (dy * self.m11 - dx * self.m12) / det,
+        )
+    }
+
+    /// Досогласовывает преобразование с фактическим размером окна.
+    ///
+    /// Камера считает свою матрицу под собственный вьюпорт. Если игра рисует
+    /// в буфер одного размера, а показывает его в окне другого, ESP уезжает
+    /// ровно на это отношение. Вписываем вьюпорт в окно с сохранением
+    /// пропорций и центрированием — при совпадающих размерах это тождество,
+    /// так что обычному случаю метод не мешает.
+    pub fn fit_to_display(self, viewport: (f32, f32), display: (f32, f32)) -> Self {
+        let sane = [viewport.0, viewport.1, display.0, display.1]
+            .iter()
+            .all(|value| value.is_finite() && *value > 1.0);
+        if !sane {
+            return self;
+        }
+        let scale = (display.0 / viewport.0).min(display.1 / viewport.1);
+        let offset_x = (display.0 - viewport.0 * scale) * 0.5;
+        let offset_y = (display.1 - viewport.1 * scale) * 0.5;
+        Self {
+            m11: self.m11 * scale,
+            m12: self.m12 * scale,
+            m21: self.m21 * scale,
+            m22: self.m22 * scale,
+            m41: self.m41 * scale + offset_x,
+            m42: self.m42 * scale + offset_y,
+        }
+    }
+}
+
+/// Снимок камеры игры за один кадр.
+#[derive(Clone, Copy, Debug)]
+pub struct CameraView {
+    pub addr: usize,
+    /// Преобразование мира в экран в системе координат вьюпорта камеры.
+    pub transform: Affine,
+    /// Взято ли оно из `m_Transform`. Ложь означает, что матрица оказалась
+    /// непригодной и преобразование собрано из зума, позиции и вьюпорта.
+    pub from_matrix: bool,
+    pub zoom: f32,
+    pub position: (f32, f32),
+    pub viewport: (f32, f32),
+}
+
+/// Читает камеру экрана.
+///
+/// Возвращает `None`, если камеры нет или ни матрица, ни собранное из полей
+/// преобразование не выглядят пригодными: вызывающий код тогда откатывается
+/// на ручные ползунки, а не рисует рамки в случайных местах.
+pub fn read_camera(screen_addr: usize) -> Option<CameraView> {
+    let addr = camera(screen_addr)?;
+    if !mem::is_readable(addr, camera_fields::PROBE_SIZE) {
+        return None;
+    }
+
+    let zoom = mem::read::<f32>(addr + camera_fields::ZOOM)?;
+    let [position_x, position_y] = mem::read::<[f32; 2]>(addr + camera_fields::CAMERA_POSITION)?;
+    let width = mem::read::<i32>(addr + camera_fields::VIEWPORT_WIDTH)?;
+    let height = mem::read::<i32>(addr + camera_fields::VIEWPORT_HEIGHT)?;
+    let viewport = (width as f32, height as f32);
+
+    let matrix = Affine::read(addr + camera_fields::TRANSFORM).filter(|affine| affine.is_usable());
+    let (transform, from_matrix) = match matrix {
+        Some(affine) => (affine, true),
+        // Запасной путь на случай, если матрица в этом кадре ещё не
+        // пересчитана: та же формула, что игра закладывает в неё сама, —
+        // сдвиг на позицию камеры, масштаб, центр вьюпорта.
+        None => {
+            let assembled = Affine {
+                m11: zoom,
+                m12: 0.0,
+                m21: 0.0,
+                m22: zoom,
+                m41: viewport.0 * 0.5 - position_x * zoom,
+                m42: viewport.1 * 0.5 - position_y * zoom,
+            };
+            (assembled, false)
+        }
+    };
+    if !transform.is_usable() {
+        return None;
+    }
+
+    Some(CameraView {
+        addr,
+        transform,
+        from_matrix,
+        zoom,
+        position: (position_x, position_y),
+        viewport,
+    })
 }
 
 /// Телепортирует персонажа, записывая `m_Position`.
@@ -441,12 +641,59 @@ pub struct TrapRef {
     pub addr: usize,
     /// Таблица методов — идентификатор конкретного класса ловушки.
     pub class: usize,
-    /// Рамка, выбранная для ESP: первая правдоподобная из двух ниже.
-    pub rect: Option<Rect>,
-    /// `m_Rectangle` (0x70) как есть, без отбраковки.
-    pub rectangle_raw: Option<Rect>,
+    /// Рамка в мировых координатах, выбранная для ESP. См. [`world_rect`].
+    pub rect: Option<RectF>,
     /// `m_Bounding` (0x50) как есть, без отбраковки.
     pub bounding_raw: Option<Rect>,
+    /// `m_Rectangle` (0x70) как есть — кадр в атласе, не положение в мире.
+    pub source_raw: Option<Rect>,
+    /// `PositionX`/`PositionY` (0x24).
+    pub position: Option<(f32, f32)>,
+    /// `Position` (0x88) — вторая мировая позиция.
+    pub position_alt: Option<(f32, f32)>,
+}
+
+/// Читает пару подряд лежащих `f32`, отбрасывая нечисла.
+fn read_vector2(addr: usize) -> Option<(f32, f32)> {
+    let [x, y] = mem::read::<[f32; 2]>(addr)?;
+    (x.is_finite() && y.is_finite()).then_some((x, y))
+}
+
+/// Выбирает мировую рамку объекта.
+///
+/// Порядок именно такой, потому что источники неравноценны:
+///
+/// 1. `m_Bounding` (0x50) — готовый прямоугольник коллизии в мировых
+///    координатах. Точнее всех, но у части объектов остаётся нулевым;
+/// 2. позиция (0x24) плюс размер кадра (0x70). Позицию игра заполняет у
+///    всех объектов из данных уровня, а размер кадра совпадает с размером
+///    объекта в мире — тайлы 48×48 и 48×96 это подтверждают;
+/// 3. вторая позиция (0x88) с тем же размером — на случай, если первая у
+///    этого класса не используется.
+///
+/// Обратите внимание, чего в списке нет: самого `m_Rectangle` как рамки.
+/// Прежняя версия ставила его первым, а это координаты в атласе текстур —
+/// отсюда и кучка рамок в углу экрана вместо ESP.
+fn world_rect(
+    bounding: Option<Rect>,
+    source: Option<Rect>,
+    position: Option<(f32, f32)>,
+    position_alt: Option<(f32, f32)>,
+) -> Option<RectF> {
+    if let Some(rect) = bounding.filter(|rect| rect.is_plausible_within(MAX_TRAP_DIMENSION)) {
+        return Some(rect.into());
+    }
+
+    let size = source.filter(|rect| rect.is_plausible_within(MAX_TRAP_DIMENSION))?;
+    let (x, y) = position
+        .filter(|&(x, y)| x != 0.0 || y != 0.0)
+        .or(position_alt)?;
+    Some(RectF {
+        x,
+        y,
+        w: size.w as f32,
+        h: size.h as f32,
+    })
 }
 
 /// Собирает ловушки уровня.
@@ -463,21 +710,20 @@ pub fn collect_traps(screen_addr: usize, out: &mut Vec<TrapRef>) {
         let Some(class) = mem::read_ptr(addr + METHOD_TABLE) else {
             continue;
         };
-        // Обе рамки сохраняются сырыми: ESP ловушек пока не выравнивается, и
-        // без исходных чисел не понять, какое из полей задаёт положение на
-        // экране. Интерфейс показывает их в строке ловушки.
-        let rectangle_raw = Rect::read(addr + trap::RECTANGLE);
+        // Все источники сохраняются сырыми: интерфейс показывает их по
+        // галочке «Показать рамки», и по ним видно, откуда взялась рамка.
         let bounding_raw = Rect::read(addr + trap::BOUNDING);
+        let source_raw = Rect::read(addr + trap::SOURCE_RECT);
+        let position = read_vector2(addr + trap::POSITION_X);
+        let position_alt = read_vector2(addr + trap::POSITION);
         out.push(TrapRef {
             addr,
             class,
-            rect: rectangle_raw
-                .filter(|rect| rect.is_plausible_within(MAX_TRAP_DIMENSION))
-                .or_else(|| {
-                    bounding_raw.filter(|rect| rect.is_plausible_within(MAX_TRAP_DIMENSION))
-                }),
-            rectangle_raw,
+            rect: world_rect(bounding_raw, source_raw, position, position_alt),
             bounding_raw,
+            source_raw,
+            position,
+            position_alt,
         });
     }
 }
@@ -560,6 +806,133 @@ mod tests {
         };
         assert!(!rect.is_plausible());
         assert!(rect.is_plausible_within(MAX_TRAP_DIMENSION));
+    }
+
+    /// Числа сняты с живой игры: строка `Object_World5` в списке ловушек.
+    #[test]
+    fn world_bounding_wins_over_the_texture_frame() {
+        let bounding = Rect {
+            x: 144,
+            y: 576,
+            w: 48,
+            h: 48,
+        };
+        // m_Rectangle этого же объекта: кадр в атласе, y всегда 0.
+        let source = Rect {
+            x: 192,
+            y: 0,
+            w: 48,
+            h: 48,
+        };
+        let rect = world_rect(Some(bounding), Some(source), Some((144.0, 576.0)), None);
+        assert_eq!(
+            rect,
+            Some(RectF {
+                x: 144.0,
+                y: 576.0,
+                w: 48.0,
+                h: 48.0
+            })
+        );
+    }
+
+    /// Числа сняты с живой игры: строка `Traps_SemiMedium2`, у которой
+    /// `m_Bounding` пуст. Рамку приходится собирать из позиции и размера
+    /// кадра — и ни в коем случае не из координат кадра.
+    #[test]
+    fn empty_bounding_falls_back_to_position_and_frame_size() {
+        let empty = Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
+        let source = Rect {
+            x: 48,
+            y: 0,
+            w: 48,
+            h: 96,
+        };
+        let rect = world_rect(Some(empty), Some(source), Some((816.0, 480.0)), None);
+        assert_eq!(
+            rect,
+            Some(RectF {
+                x: 816.0,
+                y: 480.0,
+                w: 48.0,
+                h: 96.0
+            })
+        );
+    }
+
+    #[test]
+    fn zero_position_defers_to_the_second_one() {
+        let source = Rect {
+            x: 0,
+            y: 0,
+            w: 48,
+            h: 48,
+        };
+        let rect = world_rect(None, Some(source), Some((0.0, 0.0)), Some((240.0, 96.0)));
+        assert_eq!(rect.map(|rect| (rect.x, rect.y)), Some((240.0, 96.0)));
+    }
+
+    #[test]
+    fn without_any_position_there_is_no_frame() {
+        let source = Rect {
+            x: 96,
+            y: 0,
+            w: 48,
+            h: 48,
+        };
+        assert_eq!(world_rect(None, Some(source), None, None), None);
+    }
+
+    #[test]
+    fn camera_transform_round_trips() {
+        // Матрица камеры при зуме 0.8333 и центре вьюпорта 1280x720.
+        let transform = Affine {
+            m11: 0.8333,
+            m12: 0.0,
+            m21: 0.0,
+            m22: 0.8333,
+            m41: 640.0 - 400.0 * 0.8333,
+            m42: 360.0 - 300.0 * 0.8333,
+        };
+        assert!(transform.is_usable());
+        // Позиция камеры обязана оказаться ровно в центре экрана.
+        assert_eq!(transform.to_screen(400.0, 300.0), [640.0, 360.0]);
+
+        let (x, y) = transform.to_world(640.0, 360.0);
+        assert!((x - 400.0).abs() < 0.01 && (y - 300.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn degenerate_transforms_are_rejected() {
+        let zero = Affine::from_zoom_and_offset(0.0, 0.0, 0.0);
+        assert!(!zero.is_usable());
+
+        let nan = Affine {
+            m11: f32::NAN,
+            ..Affine::from_zoom_and_offset(1.0, 0.0, 0.0)
+        };
+        assert!(!nan.is_usable());
+    }
+
+    #[test]
+    fn fitting_to_an_equal_display_changes_nothing() {
+        let transform = Affine::from_zoom_and_offset(0.8333, 120.0, -45.0);
+        assert_eq!(
+            transform.fit_to_display((1280.0, 720.0), (1280.0, 720.0)),
+            transform
+        );
+    }
+
+    #[test]
+    fn fitting_to_a_doubled_display_doubles_the_scale() {
+        let transform = Affine::from_zoom_and_offset(1.0, 0.0, 0.0);
+        let fitted = transform.fit_to_display((1280.0, 720.0), (2560.0, 1440.0));
+        assert_eq!(fitted.to_screen(100.0, 50.0), [200.0, 100.0]);
     }
 
     #[test]
