@@ -64,12 +64,23 @@ pub mod player {
     pub const DELTA_SPEED: usize = 0xE0;
     /// `InitialJumpHeight` (f32).
     pub const INITIAL_JUMP_HEIGHT: usize = 0xEC;
+    /// `moveSpeed` (f32) — горизонтальная скорость, накопленная за кадр.
+    ///
+    /// Главное поле для движения: перенос в `ApplyGravity` смотрит только на
+    /// него и не знает ничего про присед.
+    pub const MOVE_SPEED: usize = 0xF0;
     /// `GravityAmountDefault` (f32).
     pub const GRAVITY_DEFAULT: usize = 0x10C;
     /// `gravityAmount` (f32).
     pub const GRAVITY: usize = 0x110;
-    /// `m_Movement` (f32) — горизонтальное перемещение за кадр.
-    pub const MOVEMENT: usize = 0x130;
+    /// `PlayerSpeedMax` (f32) — потолок [`MOVE_SPEED`], по умолчанию 3.4.
+    pub const PLAYER_SPEED_MAX: usize = 0x114;
+    /// `JumpFloatDistance` (f32) — запас «дожатия» прыжка.
+    ///
+    /// `Jump` срабатывает только когда это поле равно своему исходному
+    /// значению (`JumpFloatDistanceTotal`, 6.0). Без его восстановления
+    /// бесконечный прыжок срабатывал через раз.
+    pub const JUMP_FLOAT_DISTANCE: usize = 0x124;
     /// `PlayerMove` (u8).
     pub const PLAYER_MOVE: usize = 0x13C;
     /// `allowInput` (u8).
@@ -84,10 +95,11 @@ pub mod player {
     pub const CAN_JUMP: usize = 0x144;
     /// `canDie` (u8).
     pub const CAN_DIE: usize = 0x150;
-    /// `m_MovePlayerAnyhow` (u8) — по имени похоже на «двигать персонажа
-    /// несмотря ни на что». Главный кандидат на снятие запрета ходить
-    /// в приседе, но именно кандидат: что игра делает с этим флагом на самом
-    /// деле, из дампа не видно, поэтому переключатель отдан пользователю.
+    /// `m_MovePlayerAnyhow` (u8).
+    ///
+    /// Имя обманчиво. Это не «двигать несмотря ни на что», а «персонажем
+    /// управляет игра»: взведённый флаг заставляет `HandleInput` пропустить
+    /// весь разбор ввода целиком — ни прыжка, ни приседа, ни шага.
     pub const MOVE_ANYHOW: usize = 0x151;
     /// `isLocal` (u8).
     pub const IS_LOCAL: usize = 0x152;

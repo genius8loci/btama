@@ -11,8 +11,11 @@
 //! * меню закрепляется на `HOME` и на время удержания показывается по
 //!   `TAB`; пока оно открыто, ввод не доходит до игры (см.
 //!   [`ImguiRenderLoop::message_filter`]);
-//! * ползунки параметров больше не перезаписываются значением из памяти
-//!   каждый кадр — текущее значение показано рядом отдельным текстом;
+//! * ползунки параметров действуют с первого сдвига и держат значение сами,
+//!   без отдельной галочки «применять»; вернуть исходное можно кнопкой;
+//! * список ловушек сгруппирован по классам: у объектов одного класса
+//!   совпадают и поля, и смысл, поэтому действие над одним осмысленно ровно
+//!   настолько же, насколько над всеми;
 //! * мировые координаты переводятся в экранные матрицей камеры игры, а не
 //!   ползунками: `Zoom`, `Cam X` и `Cam Y` остались лишь запасным путём на
 //!   случай, когда камера не читается.
@@ -39,12 +42,13 @@ const VK_HOME: i32 = 0x24;
 /// (0x22), а `VK_PRIOR` — это, наоборот, Page Up.
 const VK_NEXT: i32 = 0x22;
 
+/// Клавиши движения — ровно те, что читает сама игра в `HandleInput`.
+const MOVE_LEFT_KEYS: [i32; 2] = [0x25, 0x41];
+/// Стрелка вправо и `D`.
+const MOVE_RIGHT_KEYS: [i32; 2] = [0x27, 0x44];
+
 /// Пауза между попытками установить хук, секунды.
 const SCAN_INTERVAL: f32 = 3.0;
-
-/// Сколько строк ловушек показывать: рисовать тысячу строк ImGui дороже,
-/// чем есть от них пользы.
-const TRAP_ROWS: usize = 30;
 
 const ACCENT: [f32; 4] = [153.0 / 255.0, 102.0 / 255.0, 204.0 / 255.0, 1.0];
 const MUTED: [f32; 4] = [0.55, 0.55, 0.55, 1.0];
@@ -54,17 +58,60 @@ const ALERT: [f32; 4] = [0.95, 0.45, 0.35, 1.0];
 // СОСТОЯНИЕ
 // ============================================================================
 
+/// Один числовой параметр персонажа.
+///
+/// Галочки «применять» больше нет: ползунок начинает действовать с первого
+/// же сдвига и с этого момента прописывается каждый кадр. Именно каждый —
+/// иначе игра вернёт своё при ближайшем респавне, и «изменил и зафиксировал»
+/// превратится в «изменил на секунду».
+#[derive(Clone, Copy, Debug, Default)]
+struct Tweak {
+    /// Желаемое значение — то, что показывает ползунок.
+    value: f32,
+    /// Значение, каким оно было при первой встрече с персонажем; к нему
+    /// возвращает кнопка «Сброс».
+    original: f32,
+    /// Трогал ли пользователь ползунок. Пока нет — в память не пишем.
+    active: bool,
+}
+
+impl Tweak {
+    fn seed(&mut self, live: f32) {
+        self.value = live;
+        self.original = live;
+    }
+
+    /// Ползунок со сбросом. Возвращает значение, если его нужно записать.
+    fn draw(&mut self, ui: &Ui, label: &str, min: f32, max: f32, live: Option<f32>) -> Option<f32> {
+        ui.set_next_item_width(160.0);
+        if ui.slider(label, min, max, &mut self.value) {
+            self.active = true;
+        }
+        ui.same_line();
+        if ui.button(format!("Сброс##{label}")) {
+            self.value = self.original;
+            self.active = false;
+            // Однократная запись: снявшись с фиксации, дальше мы молчим,
+            // и без неё в памяти осталось бы последнее выставленное число.
+            return Some(self.original);
+        }
+        ui.same_line();
+        match live {
+            Some(current) => ui.text_colored(MUTED, format!("= {current:.2}")),
+            None => ui.text_colored(MUTED, "= ?"),
+        }
+        self.active.then_some(self.value)
+    }
+}
+
 /// Настройки читов для одного игрока.
 #[derive(Clone, Debug, Default)]
 struct PlayerConfig {
     god_mode: bool,
     inf_jump: bool,
-    override_speed: bool,
-    speed: f32,
-    override_jump: bool,
-    jump_height: f32,
-    override_gravity: bool,
-    gravity: f32,
+    speed: Tweak,
+    jump_height: Tweak,
+    gravity: Tweak,
     /// Снимать запрет на движение вбок, пока персонаж пригнулся.
     crouch_walk: bool,
     /// Начальные значения подтягиваются из памяти ровно один раз, при первой
@@ -85,9 +132,9 @@ impl PlayerConfig {
         if self.seeded {
             return;
         }
-        self.speed = speed;
-        self.jump_height = jump_height;
-        self.gravity = gravity;
+        self.speed.seed(speed);
+        self.jump_height.seed(jump_height);
+        self.gravity.seed(gravity);
         self.seeded = true;
     }
 }
@@ -226,6 +273,19 @@ fn game_has_focus() -> bool {
     }
 }
 
+/// Ловушки одного класса.
+///
+/// Раньше список был плоским: сорок строк, в которых одна и та же ловушка
+/// повторялась десяток раз, и каждую приходилось щёлкать отдельно. Класс —
+/// естественная единица: у его объектов совпадают и поля, и смысл, так что
+/// действие над одним осмысленно ровно настолько же, насколько над всеми.
+struct TrapGroup {
+    /// Указатель на таблицу методов — он же ключ в `class_info`.
+    class: usize,
+    /// Индексы объектов этого класса в `traps`.
+    members: Vec<usize>,
+}
+
 /// Состояние конвейера, каким оно попало в лог в последний раз.
 ///
 /// Умышленно без `objects`: их число меняется каждый кадр, и снимок с ним
@@ -251,7 +311,9 @@ pub struct CheatOverlay {
     // Переиспользуемые буферы: рендер не должен аллоцировать каждый кадр.
     objects: Vec<usize>,
     traps: Vec<TrapRef>,
-    classes: Vec<(usize, usize)>,
+    /// Ловушки, разложенные по классам. Действия применяются к группе
+    /// целиком: у объектов одного класса одни и те же поля и один смысл.
+    groups: Vec<TrapGroup>,
 
     settings: HashMap<i32, PlayerConfig>,
     /// Сведения о встреченных классах: тип из `ObjectType`, пример имени и
@@ -285,6 +347,8 @@ pub struct CheatOverlay {
     show_trap_rects: bool,
     /// Подписывать рамки ловушек именем объекта.
     show_trap_labels: bool,
+    /// Показывать сырые поля объекта за общей частью раскладки.
+    show_raw_fields: bool,
 }
 
 impl Default for CheatOverlay {
@@ -293,7 +357,7 @@ impl Default for CheatOverlay {
             disabled: false,
             objects: Vec::with_capacity(hook::MAX_OBJECTS),
             traps: Vec::with_capacity(128),
-            classes: Vec::with_capacity(16),
+            groups: Vec::with_capacity(16),
             settings: HashMap::new(),
             class_info: HashMap::new(),
             keys: Keys::default(),
@@ -311,6 +375,7 @@ impl Default for CheatOverlay {
             teleport: false,
             show_trap_rects: false,
             show_trap_labels: false,
+            show_raw_fields: false,
         }
     }
 }
@@ -414,7 +479,7 @@ impl CheatOverlay {
         } else {
             self.traps.clear();
         }
-        self.refresh_classes();
+        self.refresh_groups();
         self.report_state(ui, &world);
 
         self.draw_esp(ui, &world);
@@ -528,20 +593,24 @@ impl CheatOverlay {
     }
 
     /// Пересчитывает список классов ловушек и их количества.
-    fn refresh_classes(&mut self) {
-        self.classes.clear();
-        for item in &self.traps {
+    fn refresh_groups(&mut self) {
+        self.groups.clear();
+        for (index, item) in self.traps.iter().enumerate() {
             match self
-                .classes
+                .groups
                 .iter_mut()
-                .find(|(class, _)| *class == item.class)
+                .find(|group| group.class == item.class)
             {
-                Some((_, count)) => *count += 1,
-                None => self.classes.push((item.class, 1)),
+                Some(group) => group.members.push(index),
+                None => self.groups.push(TrapGroup {
+                    class: item.class,
+                    members: vec![index],
+                }),
             }
         }
-        self.classes
-            .sort_unstable_by_key(|&(_, count)| std::cmp::Reverse(count));
+        // Самые многочисленные наверх: в них обычно и есть смысл лезть.
+        self.groups
+            .sort_unstable_by_key(|group| std::cmp::Reverse(group.members.len()));
     }
 
     // ------------------------------------------------------------------
@@ -635,7 +704,7 @@ impl CheatOverlay {
             .flags(flags)
             .position([20.0, 20.0], Condition::FirstUseEver)
             .build(|| {
-                ui.text_colored(ACCENT, "BLOODY AMA TRAPLAND");
+                ui.text_colored(ACCENT, "BT AMA");
 
                 if !hook::is_installed() {
                     self.draw_hook_status(ui);
@@ -849,36 +918,21 @@ impl CheatOverlay {
 
             draw_crouch_flags(ui, player.addr);
 
-            slider_row(
-                ui,
-                "Speed",
-                "##ospd",
-                &mut config.override_speed,
-                &mut config.speed,
-                0.0,
-                400.0,
-                stats.speed,
-            );
-            slider_row(
-                ui,
-                "Jump H",
-                "##ojmp",
-                &mut config.override_jump,
-                &mut config.jump_height,
-                0.0,
-                100.0,
-                stats.jump_height,
-            );
-            slider_row(
-                ui,
-                "Gravity",
-                "##ogrv",
-                &mut config.override_gravity,
-                &mut config.gravity,
-                0.0,
-                2.0,
-                stats.gravity,
-            );
+            // Ползунки рисуются только при открытом меню, а применяются
+            // всегда — значения хранит `config`, а не интерфейс.
+            if let Some(value) = config.speed.draw(ui, "Speed", 0.0, 400.0, stats.speed) {
+                game::set_speed(player.addr, value);
+            }
+            if let Some(value) =
+                config
+                    .jump_height
+                    .draw(ui, "Jump H", 0.0, 100.0, stats.jump_height)
+            {
+                game::set_jump_height(player.addr, value);
+            }
+            if let Some(value) = config.gravity.draw(ui, "Gravity", 0.0, 2.0, stats.gravity) {
+                game::set_gravity(player.addr, value);
+            }
         }
 
         // Эффекты применяются всегда, а не только при открытом меню.
@@ -888,19 +942,23 @@ impl CheatOverlay {
         if config.inf_jump {
             game::set_infinite_jump(player.addr);
         }
-        if config.override_speed {
-            game::set_speed(player.addr, config.speed);
+        if config.speed.active {
+            game::set_speed(player.addr, config.speed.value);
         }
-        if config.override_jump {
-            game::set_jump_height(player.addr, config.jump_height);
+        if config.jump_height.active {
+            game::set_jump_height(player.addr, config.jump_height.value);
         }
-        if config.override_gravity {
-            game::set_gravity(player.addr, config.gravity);
+        if config.gravity.active {
+            game::set_gravity(player.addr, config.gravity.value);
         }
-        // Только пока персонаж действительно пригнулся: держать флаг взведённым
-        // постоянно значило бы менять поведение и в обычной ходьбе.
-        if config.crouch_walk && game::is_crouching(player.addr) {
-            game::allow_crouch_movement(player.addr);
+        // Только пока персонаж действительно пригнулся и просит идти: вне
+        // приседа игра справляется сама, и вмешательство только мешало бы
+        // её собственному разгону и трению.
+        if config.crouch_walk
+            && game::is_crouching(player.addr)
+            && let Some(direction) = movement_direction(ui)
+        {
+            game::set_crouch_movement(player.addr, direction);
         }
 
         if self.menu_open {
@@ -932,15 +990,25 @@ impl CheatOverlay {
                 ui.checkbox("Рисовать ESP ловушек", &mut self.show_trap_esp);
                 ui.same_line();
                 ui.checkbox("Показать рамки", &mut self.show_trap_rects);
-                ui.same_line();
-                ui.checkbox("Подписи", &mut self.show_trap_labels);
                 if ui.is_item_hovered() {
                     ui.tooltip_text(
-                        "Сырые источники рамки по каждой ловушке:\n\
+                        "Сырые источники рамки по каждому объекту класса:\n\
                          поз — PositionX/PositionY (0x24), в этой сборке всегда 0;\n\
                          0x50 — m_Bounding, коллизия в пикселях мира;\n\
                          0x70 — m_Rectangle, кадр в атласе текстур (не мир!);\n\
                          0x88 — Position в единицах физического движка.",
+                    );
+                }
+                ui.same_line();
+                ui.checkbox("Подписи", &mut self.show_trap_labels);
+                ui.same_line();
+                ui.checkbox("Сырые поля", &mut self.show_raw_fields);
+                if ui.is_item_hovered() {
+                    ui.tooltip_text(
+                        "Дамп 0x90..0x100 у первого объекта каждого класса.\n\
+                         Раскладка Spinner, Trampoline, TrapBlock и прочих новых типов\n\
+                         не снята, гадать смещения и писать по ним нельзя — а прочитать\n\
+                         и посмотреть глазами можно.",
                     );
                 }
                 ui.text(format!(
@@ -960,102 +1028,84 @@ impl CheatOverlay {
                 }
                 ui.separator();
 
-                self.draw_trap_classes(ui);
-                ui.separator();
-
-                let shown = self.traps.len().min(TRAP_ROWS);
-                if self.traps.len() > shown {
-                    ui.text_colored(
-                        MUTED,
-                        format!("Показаны первые {shown} из {}", self.traps.len()),
-                    );
-                }
-                for index in 0..shown {
-                    let item = self.traps[index];
+                for index in 0..self.groups.len() {
                     let _id = ui.push_id(index.to_string());
-                    self.draw_trap_row(ui, index, item);
+                    self.draw_trap_group(ui, index);
                 }
             });
     }
 
-    /// Классы ловушек и пометка «это BoomTrap».
+    /// Одна строка на класс: тип, имя ассета, количество и общие флаги.
     ///
-    /// Классы, найденные на уровне: тип, пример имени и количество.
+    /// Флаги показывают состояние первого объекта группы, а записываются во
+    /// все сразу. Если объекты разошлись, к метке добавляется звёздочка —
+    /// клик тогда не «переключает», а выравнивает группу.
     ///
-    /// Раскладка объектов совпадает только до 0x90; дальше у `Trap`,
-    /// `BoomTrap`, `QuickGoal` и `SPSpawn` лежат разные поля, а у последних
-    /// двух объект там попросту заканчивается. Раньше приходилось помечать
-    /// класс вручную, потому что имя типа считалось недоступным. Оно доступно:
-    /// игра сама пишет его в `ObjectType` (0x10) — там лежит `"BoomTrap"`,
-    /// `"Trap"` и так далее. Список стал справочным, выбирать больше нечего.
-    fn draw_trap_classes(&self, ui: &Ui) {
-        ui.text_colored(MUTED, "Классы уровня (ObjectType x количество):");
-        for &(class, count) in &self.classes {
-            let Some(info) = self.class_info.get(&class) else {
-                continue;
-            };
-            let color = match info.role {
-                TrapRole::Base => MUTED,
-                _ => ACCENT,
-            };
-            ui.text_colored(color, format!("{:<12} x{count}", info.label()));
-            ui.same_line();
-            ui.text_colored(MUTED, format!("{}  0x{class:X}", info.sample_name));
-            if ui.is_item_hovered() {
-                ui.tooltip_text(format!(
-                    "ObjectType (0x10): {}\nПример имени (0x20): {}\nТаблица методов: 0x{class:X}\n\n\
-                     Читаем поля: {}",
-                    display_or_dash(&info.object_type),
-                    display_or_dash(&info.sample_name),
-                    match info.role {
-                        TrapRole::Base => "только WorldObject, до 0x90",
-                        TrapRole::Trap => "WorldObject + m_Bounding (0xA4), TextureSize (0x94)",
-                        TrapRole::Boom =>
-                            "WorldObject + Speed (0xA4), CanTrigger (0xAC), координаты движения",
-                    },
-                ));
-            }
-        }
-    }
-
-    fn draw_trap_row(&mut self, ui: &Ui, index: usize, item: TrapRef) {
-        let names = game::trap_names(item.addr);
-        // Слева тип объекта, за ним — имя конкретного ассета. Тип отвечает
-        // на вопрос «что это», имя — «который именно».
-        let kind = match names.object_type.as_str() {
-            "" => format!("Trap #{index}"),
-            kind => kind.to_string(),
+    /// Индекс, а не ссылка на группу: рисование читает `self.traps` и
+    /// `self.class_info`, и одновременное заимствование группы ссылкой
+    /// заставило бы копировать её каждый кадр.
+    fn draw_trap_group(&self, ui: &Ui, index: usize) {
+        let group = &self.groups[index];
+        let Some(&first) = group.members.first() else {
+            return;
         };
-        highlighted_label(ui, &format!("{kind:<12}"), color_for(item.addr));
+        let item = self.traps[first];
+        let addresses: Vec<usize> = group
+            .members
+            .iter()
+            .map(|&index| self.traps[index].addr)
+            .collect();
+
+        let info = self.class_info.get(&group.class);
+        let kind = info.map(|info| info.label()).unwrap_or("");
+        let name = info.map(|info| info.sample_name.as_str()).unwrap_or("");
+
+        highlighted_label(
+            ui,
+            &format!("{:<12}", if kind.is_empty() { "?" } else { kind }),
+            color_for(group.class),
+        );
         ui.same_line();
-        ui.text_colored(MUTED, format!("{:<20}", names.name));
+        ui.text_colored(MUTED, format!("{name:<20} x{}", group.members.len()));
         if ui.is_item_hovered() {
             ui.tooltip_text(format!(
-                "ObjectType (0x10): {}\nName (0x20): {}\nTextureName (0x0C): {}\nZoneName (0x1C): {}\n\
-                 Класс: 0x{:X}\nАдрес: 0x{:X}",
-                display_or_dash(&names.object_type),
-                display_or_dash(&names.name),
-                display_or_dash(&names.texture),
-                display_or_dash(&names.zone),
-                item.class,
-                item.addr,
+                "ObjectType (0x10): {}
+Name (0x20): {}
+TextureName (0x0C): {}
+ZoneName (0x1C): {}
+                 Таблица методов: 0x{:X}
+
+Читаем поля: {}
+Объектов на уровне: {}",
+                display_or_dash(kind),
+                display_or_dash(name),
+                display_or_dash(info.map(|info| info.texture.as_str()).unwrap_or("")),
+                display_or_dash(info.map(|info| info.zone.as_str()).unwrap_or("")),
+                group.class,
+                match info.map(|info| info.role).unwrap_or_default() {
+                    TrapRole::Base => "только WorldObject, до 0x90",
+                    TrapRole::Trap => "WorldObject + m_Bounding (0xA4), TextureSize (0x94)",
+                    TrapRole::Boom =>
+                        "WorldObject + Speed (0xA4), CanTrigger (0xAC), координаты движения",
+                },
+                group.members.len(),
             ));
         }
         ui.same_line();
 
-        flag_checkbox(ui, "U", "Used", item.addr, trap::USED);
+        group_flag(ui, "U", "Used", &addresses, trap::USED);
         ui.same_line();
-        flag_checkbox(ui, "Up", "Updateable", item.addr, trap::UPDATEABLE);
+        group_flag(ui, "Up", "Updateable", &addresses, trap::UPDATEABLE);
         ui.same_line();
-        flag_checkbox(ui, "G", "GoreStick", item.addr, trap::GORE_STICK);
+        group_flag(ui, "G", "GoreStick", &addresses, trap::GORE_STICK);
 
-        if item.boom.is_some() && game::supports_boom_fields(item.addr) {
+        if item.boom.is_some() {
             ui.same_line();
-            flag_checkbox(
+            group_flag(
                 ui,
                 "T",
                 "CanTrigger (BoomTrap)",
-                item.addr,
+                &addresses,
                 trap::BOOM_CAN_TRIGGER,
             );
 
@@ -1067,49 +1117,60 @@ impl CheatOverlay {
                     .range(0.0, 50.0)
                     .build(ui, &mut speed)
                 {
-                    game::set_trap_speed(item.addr, speed);
+                    for &addr in &addresses {
+                        game::set_trap_speed(addr, speed);
+                    }
                 }
                 if ui.is_item_hovered() {
-                    ui.tooltip_text("Speed (BoomTrap)");
+                    ui.tooltip_text("Speed (BoomTrap) — пишется во все объекты класса");
                 }
             }
         }
 
-        // Отдельными строками в конце, чтобы не ломать выкладку кнопок выше.
         if self.show_trap_rects {
+            for &member in &group.members {
+                self.draw_trap_numbers(ui, self.traps[member]);
+            }
+        }
+        if self.show_raw_fields {
+            draw_raw_fields(ui, item.addr);
+        }
+    }
+
+    /// Сырые источники рамки по одному объекту.
+    fn draw_trap_numbers(&self, ui: &Ui, item: TrapRef) {
+        ui.text_colored(
+            MUTED,
+            format!(
+                "    поз {} | 0x50 {} | 0x70 {} | 0x88 {}",
+                format_point(item.position),
+                format_rect(item.bounding_raw),
+                format_rect(item.source_raw),
+                format_point(item.position_alt),
+            ),
+        );
+        if let Some(fields) = item.trap {
             ui.text_colored(
                 MUTED,
                 format!(
-                    "    поз {} | 0x50 {} | 0x70 {} | 0x88 {}",
-                    format_point(item.position),
-                    format_rect(item.bounding_raw),
-                    format_rect(item.source_raw),
-                    format_point(item.position_alt),
+                    "    Trap: 0xA4 рамка {} | 0x94 размер текстуры {}",
+                    format_rect(fields.bounding),
+                    format_rect(fields.texture_size),
                 ),
             );
-            if let Some(fields) = item.trap {
-                ui.text_colored(
-                    MUTED,
-                    format!(
-                        "    Trap: 0xA4 рамка {} | 0x94 размер текстуры {}",
-                        format_rect(fields.bounding),
-                        format_rect(fields.texture_size),
-                    ),
-                );
-            }
-            // Координаты подвижной ловушки: по ним видно, какое из полей
-            // действительно едет вслед за ней, а какое стоит на месте спавна.
-            if let Some(boom) = item.boom {
-                ui.text_colored(
-                    MUTED,
-                    format!(
-                        "    Boom: 0xB0 старт {} | 0xC8 пред. {} | 0xD0 симуляция {}",
-                        format_point(boom.original_position),
-                        format_point(boom.previous_position),
-                        format_point(boom.simulation_position),
-                    ),
-                );
-            }
+        }
+        // Координаты подвижной ловушки: по ним видно, какое из полей
+        // действительно едет вслед за ней, а какое стоит на месте спавна.
+        if let Some(boom) = item.boom {
+            ui.text_colored(
+                MUTED,
+                format!(
+                    "    Boom: 0xB0 старт {} | 0xC8 пред. {} | 0xD0 симуляция {}",
+                    format_point(boom.original_position),
+                    format_point(boom.previous_position),
+                    format_point(boom.simulation_position),
+                ),
+            );
         }
     }
 }
@@ -1169,7 +1230,7 @@ fn format_point(point: Option<(f32, f32)>) -> String {
 /// взяты в изменяемое заимствование, и `&self` конфликтовал бы с ним.
 fn draw_crouch_flags(ui: &Ui, addr: usize) {
     ui.text_colored(MUTED, "Присед:");
-    for (label, offset) in game::CROUCH_FLAGS {
+    for (label, offset, tooltip) in game::CROUCH_FLAGS {
         ui.same_line();
         let Some(mut value) = game::player_flag(addr, offset) else {
             ui.text_colored(MUTED, "-");
@@ -1179,11 +1240,115 @@ fn draw_crouch_flags(ui: &Ui, addr: usize) {
             game::set_player_flag(addr, offset, value);
             log::info!("флаг {label} (0x{offset:X}) = {value}");
         }
+        if ui.is_item_hovered() {
+            ui.tooltip_text(format!(
+                "0x{offset:X}
+{tooltip}"
+            ));
+        }
     }
     ui.same_line();
-    match game::movement(addr) {
-        Some(movement) => ui.text_colored(MUTED, format!("m_Movement = {movement:.2}")),
-        None => ui.text_colored(MUTED, "m_Movement = ?"),
+    match game::move_speed(addr) {
+        Some(speed) => ui.text_colored(MUTED, format!("moveSpeed = {speed:.2}")),
+        None => ui.text_colored(MUTED, "moveSpeed = ?"),
+    }
+}
+
+/// Куда игрок просит идти — по тем же клавишам, что читает игра.
+///
+/// Обе нажатые сразу дают ноль: в игре они складываются в противоположные
+/// слагаемые и гасят друг друга, и здесь должно быть так же.
+fn movement_direction(ui: &Ui) -> Option<f32> {
+    if !game_has_focus() || ui.io().want_capture_keyboard {
+        return None;
+    }
+    let left = MOVE_LEFT_KEYS.iter().copied().any(key_down);
+    let right = MOVE_RIGHT_KEYS.iter().copied().any(key_down);
+    match (left, right) {
+        (true, false) => Some(-1.0),
+        (false, true) => Some(1.0),
+        _ => None,
+    }
+}
+
+/// Флаг, общий для целой группы объектов.
+///
+/// Показывает состояние первого, пишет во все. Если объекты группы разошлись,
+/// к метке добавляется звёздочка: клик тогда не переключает флаг, а выравнивает
+/// группу по показанному значению. Идентификатор виджета от звёздочки не
+/// зависит — он задан частью после `##`, иначе ImGui терял бы состояние
+/// ровно в тот момент, когда группа расходится.
+fn group_flag(ui: &Ui, label: &str, tooltip: &str, addresses: &[usize], offset: usize) {
+    let mut values = addresses
+        .iter()
+        .map(|&addr| game::trap_flag(addr, offset))
+        .peekable();
+    let Some(Some(mut value)) = values.peek().copied() else {
+        ui.text_colored(MUTED, "-");
+        return;
+    };
+    let mixed = values.any(|other| other != Some(value));
+
+    let caption = if mixed {
+        format!("{label}*##{label}")
+    } else {
+        format!("{label}##{label}")
+    };
+    if ui.checkbox(caption, &mut value) {
+        for &addr in addresses {
+            game::set_trap_flag(addr, offset, value);
+        }
+    }
+    if ui.is_item_hovered() {
+        ui.tooltip_text(if mixed {
+            format!(
+                "{tooltip}
+Значения в группе разошлись — клик выровняет все {}",
+                addresses.len()
+            )
+        } else {
+            format!(
+                "{tooltip}
+Пишется во все объекты класса ({})",
+                addresses.len()
+            )
+        });
+    }
+}
+
+/// Сырые поля объекта за общей частью `WorldObject`.
+///
+/// Раскладки новых типов (`Spinner`, `Trampoline`, `TrapBlock`, `Weather`)
+/// у нас не сняты, а гадать смещения и писать по ним нельзя. Зато прочитать
+/// и показать — можно: по столбцу чисел видно, где скорость вращения, где
+/// счётчик, а где указатель. Только чтение, ничего не пишется.
+fn draw_raw_fields(ui: &Ui, addr: usize) {
+    /// Общая часть заканчивается здесь — дальше начинается своё у каждого типа.
+    const FROM: usize = 0x90;
+    /// Дальше этого заглядывать смысла нет: самый длинный известный класс,
+    /// `BoomTrap`, укладывается в 0xE0.
+    const TO: usize = 0x100;
+
+    for offset in (FROM..TO).step_by(4) {
+        let Some(raw) = crate::mem::read::<u32>(addr + offset) else {
+            ui.text_colored(ALERT, format!("    +0x{offset:02X} недоступно"));
+            return;
+        };
+        let float = f32::from_bits(raw);
+        // Дробное показываем, только когда оно осмысленно: биты указателя,
+        // прочитанные как float, дают числа вроде 1e-38 и только мешают.
+        let as_float = if float.is_finite() && (float == 0.0 || float.abs() > 1e-3) {
+            format!(" f={float:.3}")
+        } else {
+            String::new()
+        };
+        ui.text_colored(
+            MUTED,
+            format!(
+                "    +0x{offset:02X}  0x{raw:08X}  i={}{as_float}",
+                raw as i32
+            ),
+        );
     }
 }
 
@@ -1203,49 +1368,6 @@ fn draw_log_location(ui: &Ui) {
                 ui.tooltip_text(problem.as_deref().unwrap_or("причина не записана"));
             }
         }
-    }
-}
-
-/// Чекбокс поверх байтового поля в памяти игры.
-///
-/// Если объект исчез, чтение вернёт `None`, и строка просто не отрисуется —
-/// вместо записи по мёртвому адресу.
-fn flag_checkbox(ui: &Ui, label: &str, tooltip: &str, addr: usize, offset: usize) {
-    let Some(mut value) = game::trap_flag(addr, offset) else {
-        ui.text_colored(MUTED, "-");
-        return;
-    };
-    if ui.checkbox(label, &mut value) {
-        game::set_trap_flag(addr, offset, value);
-    }
-    if ui.is_item_hovered() {
-        ui.tooltip_text(tooltip);
-    }
-}
-
-/// Строка «галка оверрайда + ползунок + текущее значение из памяти».
-///
-/// Ползунок хранит желаемое значение и не перезаписывается из памяти —
-/// в прежней версии его нельзя было сдвинуть, пока не включён оверрайд.
-#[allow(clippy::too_many_arguments)]
-fn slider_row(
-    ui: &Ui,
-    label: &str,
-    toggle_id: &str,
-    enabled: &mut bool,
-    value: &mut f32,
-    min: f32,
-    max: f32,
-    live: Option<f32>,
-) {
-    ui.checkbox(toggle_id, enabled);
-    ui.same_line();
-    ui.set_next_item_width(160.0);
-    ui.slider(label, min, max, value);
-    ui.same_line();
-    match live {
-        Some(current) => ui.text_colored(MUTED, format!("= {current:.2}")),
-        None => ui.text_colored(MUTED, "= ?"),
     }
 }
 

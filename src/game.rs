@@ -605,10 +605,23 @@ pub fn set_god_mode(addr: usize) -> bool {
     mem::write::<u8>(addr + player::CAN_DIE, 0)
 }
 
-/// `CanJump = 1`, `JumpBeenReleased = 1`.
+/// Исходное значение `JumpFloatDistance` — статическое поле
+/// `Player.JumpFloatDistanceTotal`.
+const JUMP_FLOAT_DISTANCE_TOTAL: f32 = 6.0;
+
+/// Возвращает всё, что `Jump` проверяет перед прыжком.
+///
+/// Двух флагов было мало: условие в `Jump` выглядит как
+/// `JumpFloatDistance == JumpFloatDistanceTotal && JumpBeenReleased`, и
+/// израсходованный запас «дожатия» глушил прыжок независимо от `CanJump`.
+/// Отсюда и срабатывание через раз.
 pub fn set_infinite_jump(addr: usize) -> bool {
     mem::write::<u8>(addr + player::CAN_JUMP, 1)
         && mem::write::<u8>(addr + player::JUMP_BEEN_RELEASED, 1)
+        && mem::write::<f32>(
+            addr + player::JUMP_FLOAT_DISTANCE,
+            JUMP_FLOAT_DISTANCE_TOTAL,
+        )
 }
 
 /// `Alive = 0` — игра заметит это и заспавнит игрока заново.
@@ -616,18 +629,41 @@ pub fn respawn(addr: usize) -> bool {
     mem::write::<u8>(addr + player::ALIVE, 0)
 }
 
-/// Флаги, вокруг которых крутится запрет ходить в приседе.
+/// Флаги состояния персонажа, полезные при разборе полётов.
 ///
-/// Какой именно из них игра проверяет, по дампу не видно: у нас есть имена
-/// полей, но не код метода `Update`. Поэтому все они показываются живыми
-/// значениями и правятся вручную — так нужный находится за один заход,
-/// а не за пять пересборок.
-pub const CROUCH_FLAGS: [(&str, usize); 5] = [
-    ("Crouching", player::CROUCHING),
-    ("ForceCrouch", player::FORCE_CROUCH),
-    ("PlayerMove", player::PLAYER_MOVE),
-    ("allowInput", player::ALLOW_INPUT),
-    ("MoveAnyhow", player::MOVE_ANYHOW),
+/// Каждый снабжён пояснением из исходного кода игры — теперь он у нас есть,
+/// и гадать по именам больше не нужно.
+pub const CROUCH_FLAGS: [(&str, usize, &str); 5] = [
+    (
+        "Crouching",
+        player::CROUCHING,
+        "Пригнулся. HandleInput сбрасывает его каждый кадр и ставит заново\n\
+         по удержанию «вниз», так что удерживать его снаружи бесполезно.",
+    ),
+    (
+        "ForceCrouch",
+        player::FORCE_CROUCH,
+        "Присед, навязанный низким потолком. Ставится в Update по пересечению\n\
+         SmallBoundingBox с геометрией; если при этом некуда шагнуть — смерть\n\
+         от сдавливания.",
+    ),
+    (
+        "PlayerMove",
+        player::PLAYER_MOVE,
+        "Игрок сам нажал вбок в этом кадре. Только для выбора анимации.",
+    ),
+    (
+        "allowInput",
+        player::ALLOW_INPUT,
+        "Сбрасывается в Reset. На разбор ввода в этой версии не влияет.",
+    ),
+    (
+        "MoveAnyhow",
+        player::MOVE_ANYHOW,
+        "ОСТОРОЖНО: включённый m_MovePlayerAnyhow заставляет HandleInput\n\
+         пропустить весь разбор ввода — ни прыжка, ни приседа, ни движения.\n\
+         Игра пользуется им, когда ведёт персонажа сама (QuickGoal).",
+    ),
 ];
 
 pub fn player_flag(addr: usize, offset: usize) -> Option<bool> {
@@ -644,19 +680,37 @@ pub fn is_crouching(addr: usize) -> bool {
         || player_flag(addr, player::FORCE_CROUCH).unwrap_or(false)
 }
 
-/// Снимает запрет на движение в приседе, взводя `m_MovePlayerAnyhow`.
+/// Во сколько раз перекрывать потолок скорости при записи `moveSpeed`.
 ///
-/// Флаг выбран по имени — «двигать персонажа несмотря ни на что», — но это
-/// догадка, а не факт: проверить её можно только в игре. Поэтому он и
-/// применяется лишь пока персонаж действительно пригнулся, и лишь по явно
-/// включённому переключателю.
-pub fn allow_crouch_movement(addr: usize) -> bool {
-    set_player_flag(addr, player::MOVE_ANYHOW, true)
+/// Игра сначала гасит скорость (`moveSpeed *= 0.45`), и только потом
+/// обрезает её по `PlayerSpeedMax`. Тройной запас гарантированно доживает
+/// до обрезки, а всё лишнее она и снимет.
+const CROUCH_SPEED_HEADROOM: f32 = 3.0;
+
+/// Двигает пригнувшегося персонажа вбок: `direction` это -1 влево, +1 вправо.
+///
+/// В `HandleInput` весь горизонтальный ввод стоит под `if (!this.Crouching)`,
+/// поэтому в приседе игра просто не прибавляет `moveSpeed`. Держать при этом
+/// `Crouching = 0` снаружи бесполезно: тот же метод сбрасывает и выставляет
+/// флаг заново в пределах одного вызова.
+///
+/// Зато сам перенос в `ApplyGravity` про присед ничего не знает — он двигает
+/// персонажа всегда, когда `moveSpeed != 0`, и по дороге честно спрашивает
+/// `MayWalk`. Значит, достаточно вписать скорость самим: столкновения,
+/// потолок скорости и трение останутся игровыми.
+pub fn set_crouch_movement(addr: usize, direction: f32) -> bool {
+    let Some(max) = mem::read::<f32>(addr + player::PLAYER_SPEED_MAX) else {
+        return false;
+    };
+    mem::write::<f32>(
+        addr + player::MOVE_SPEED,
+        direction * max * CROUCH_SPEED_HEADROOM,
+    )
 }
 
-/// `m_Movement` (0x130) — горизонтальное перемещение, посчитанное игрой.
-pub fn movement(addr: usize) -> Option<f32> {
-    mem::read::<f32>(addr + player::MOVEMENT)
+/// `moveSpeed` (0xF0) — та самая скорость, которой игра двигает персонажа.
+pub fn move_speed(addr: usize) -> Option<f32> {
+    mem::read::<f32>(addr + player::MOVE_SPEED)
 }
 
 pub fn set_speed(addr: usize, value: f32) -> bool {
@@ -752,6 +806,10 @@ pub struct ClassInfo {
     pub object_type: String,
     /// `Name` (0x20) первого встреченного объекта этого класса.
     pub sample_name: String,
+    /// `TextureName` (0x0C).
+    pub texture: String,
+    /// `ZoneName` (0x1C) — уровень, которому принадлежит объект.
+    pub zone: String,
     pub role: TrapRole,
 }
 
@@ -761,6 +819,8 @@ impl ClassInfo {
         Self {
             role: TrapRole::from_object_type(&object_type),
             sample_name: read_string_field(addr, trap::NAME),
+            texture: read_string_field(addr, trap::TEXTURE_NAME),
+            zone: read_string_field(addr, trap::ZONE_NAME),
             object_type,
         }
     }
@@ -998,38 +1058,15 @@ pub fn collect_traps(
     sim_scale
 }
 
-/// Имена, которыми игра сама подписывает объект.
-///
-/// Настоящего имени класса среди них нет и взяться ему неоткуда: у нас есть
-/// только указатель на таблицу методов, а вытаскивать имя типа означало бы
-/// разбирать внутренности CLR — раскладку `MethodTable` и `EEClass`, которая
-/// меняется от версии .NET к версии. Это же — обычные строковые поля объекта,
-/// и их достаточно, чтобы отличить пилу от блока земли.
-#[derive(Clone, Debug, Default)]
-pub struct TrapNames {
-    /// `<Name>` (0x20) — имя ассета: `Traps_Small3`, `Object_World5`.
-    pub name: String,
-    /// `<ObjectType>` (0x10) — категория объекта, если это строка.
-    pub object_type: String,
-    /// `<TextureName>` (0x0C).
-    pub texture: String,
-    /// `<ZoneName>` (0x1C).
-    pub zone: String,
-}
-
+/// Настоящего имени класса среди полей объекта нет и взяться ему неоткуда:
+/// у нас есть только указатель на таблицу методов, а вытаскивать имя типа
+/// означало бы разбирать внутренности CLR — раскладку `MethodTable` и
+/// `EEClass`, которая меняется от версии .NET к версии. Зато сама игра
+/// подписывает объект четырьмя строковыми полями, и их вполне достаточно.
 fn read_string_field(addr: usize, offset: usize) -> String {
     mem::read_ptr(addr + offset)
         .and_then(mem::read_dotnet_string)
         .unwrap_or_default()
-}
-
-pub fn trap_names(addr: usize) -> TrapNames {
-    TrapNames {
-        name: read_string_field(addr, trap::NAME),
-        object_type: read_string_field(addr, trap::OBJECT_TYPE),
-        texture: read_string_field(addr, trap::TEXTURE_NAME),
-        zone: read_string_field(addr, trap::ZONE_NAME),
-    }
 }
 
 /// Читает булево поле ловушки.
@@ -1040,17 +1077,6 @@ pub fn trap_flag(addr: usize, offset: usize) -> Option<bool> {
 /// Пишет булево поле ловушки.
 pub fn set_trap_flag(addr: usize, offset: usize, value: bool) -> bool {
     mem::write::<u8>(addr + offset, u8::from(value))
-}
-
-/// Может ли объект нести поля `BoomTrap` (`Speed`, `m_CanTrigger`).
-///
-/// Проверяется только доступность памяти: принадлежность класса решает
-/// пользователь, помечая его в интерфейсе. Автоматически определить её
-/// нельзя — имена классов в рантайме нам недоступны, — а писать эти поля
-/// вслепую нельзя тем более: у базового `Trap` по тем же адресам лежит
-/// прямоугольник коллизии.
-pub fn supports_boom_fields(addr: usize) -> bool {
-    mem::is_readable(addr, trap::BOOM_PROBE_SIZE)
 }
 
 pub fn trap_speed(addr: usize) -> Option<f32> {
