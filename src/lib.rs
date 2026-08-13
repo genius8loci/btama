@@ -54,7 +54,7 @@ use std::sync::Once;
 use hudhook::Hudhook;
 use hudhook::hooks::dx9::ImguiDx9Hooks;
 use minhook_sys::{MH_ERROR_ALREADY_INITIALIZED, MH_Initialize, MH_OK};
-use windows::Win32::Foundation::{BOOL, HINSTANCE, HMODULE};
+use windows::Win32::Foundation::{HINSTANCE, HMODULE};
 use windows::Win32::System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};
 
 use overlay::CheatOverlay;
@@ -94,7 +94,10 @@ fn initialize() {
     // Ставится здесь, а не в DllMain: `set_hook` выделяет память, а под
     // блокировкой загрузчика этого лучше не делать.
     install_panic_hook();
-    log::info!("инициализация, лог: {}", log::log_path().display());
+    // Открывает файл лога и сразу пишет туда отбивку. Раньше файл заводился
+    // лениво, первым же сообщением, и его отсутствие ничем не отличалось от
+    // сломанного логирования.
+    log::start_session();
 
     // MinHook общий на процесс: его же использует hudhook, который
     // терпимо относится к повторной инициализации.
@@ -111,11 +114,16 @@ fn initialize() {
 }
 
 fn attach(module: HMODULE) {
-    let instance = HINSTANCE(module.0);
+    // Через границу потока едет число, а не сам дескриптор: начиная с
+    // windows 0.62 `HMODULE` — это обёртка над `*mut c_void`, а сырой
+    // указатель не `Send`. Значение при этом то же самое, база загрузки
+    // модуля, и она никуда не денется, пока библиотека загружена.
+    let module_base = module.0 as usize;
 
     std::thread::spawn(move || {
         initialize();
 
+        let instance = HINSTANCE(module_base as *mut c_void);
         let overlay = Hudhook::builder()
             .with::<ImguiDx9Hooks>(CheatOverlay::new())
             .with_hmodule(instance)
@@ -150,12 +158,15 @@ fn detach(reserved: *mut c_void) {
 /// # Safety
 ///
 /// Вызывается только загрузчиком Windows с корректными аргументами.
+/// Возвращаемый тип — `i32`, а не `BOOL`: в windows 0.62 этой обёртки в
+/// `Win32::Foundation` больше нет, а `BOOL` в Win32 и так объявлен как
+/// `typedef int`, так что по ABI это ровно то же самое.
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn DllMain(module: HMODULE, reason: u32, reserved: *mut c_void) -> BOOL {
+pub unsafe extern "system" fn DllMain(module: HMODULE, reason: u32, reserved: *mut c_void) -> i32 {
     match reason {
         DLL_PROCESS_ATTACH => attach(module),
         DLL_PROCESS_DETACH => detach(reserved),
         _ => {}
     }
-    BOOL(1)
+    1
 }

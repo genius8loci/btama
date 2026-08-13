@@ -18,6 +18,7 @@
 //! не значит. Между кадрами переживает только подсказка [`LAST_LOCAL`], и та
 //! проходит полную проверку перед каждым использованием.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::mem;
@@ -615,6 +616,49 @@ pub fn respawn(addr: usize) -> bool {
     mem::write::<u8>(addr + player::ALIVE, 0)
 }
 
+/// Флаги, вокруг которых крутится запрет ходить в приседе.
+///
+/// Какой именно из них игра проверяет, по дампу не видно: у нас есть имена
+/// полей, но не код метода `Update`. Поэтому все они показываются живыми
+/// значениями и правятся вручную — так нужный находится за один заход,
+/// а не за пять пересборок.
+pub const CROUCH_FLAGS: [(&str, usize); 5] = [
+    ("Crouching", player::CROUCHING),
+    ("ForceCrouch", player::FORCE_CROUCH),
+    ("PlayerMove", player::PLAYER_MOVE),
+    ("allowInput", player::ALLOW_INPUT),
+    ("MoveAnyhow", player::MOVE_ANYHOW),
+];
+
+pub fn player_flag(addr: usize, offset: usize) -> Option<bool> {
+    mem::read::<u8>(addr + offset).map(|value| value != 0)
+}
+
+pub fn set_player_flag(addr: usize, offset: usize, value: bool) -> bool {
+    mem::write::<u8>(addr + offset, u8::from(value))
+}
+
+/// Пригнулся ли персонаж прямо сейчас.
+pub fn is_crouching(addr: usize) -> bool {
+    player_flag(addr, player::CROUCHING).unwrap_or(false)
+        || player_flag(addr, player::FORCE_CROUCH).unwrap_or(false)
+}
+
+/// Снимает запрет на движение в приседе, взводя `m_MovePlayerAnyhow`.
+///
+/// Флаг выбран по имени — «двигать персонажа несмотря ни на что», — но это
+/// догадка, а не факт: проверить её можно только в игре. Поэтому он и
+/// применяется лишь пока персонаж действительно пригнулся, и лишь по явно
+/// включённому переключателю.
+pub fn allow_crouch_movement(addr: usize) -> bool {
+    set_player_flag(addr, player::MOVE_ANYHOW, true)
+}
+
+/// `m_Movement` (0x130) — горизонтальное перемещение, посчитанное игрой.
+pub fn movement(addr: usize) -> Option<f32> {
+    mem::read::<f32>(addr + player::MOVEMENT)
+}
+
 pub fn set_speed(addr: usize, value: f32) -> bool {
     mem::write::<f32>(addr + player::DELTA_SPEED, value)
 }
@@ -649,8 +693,68 @@ pub struct TrapRef {
     pub source_raw: Option<Rect>,
     /// `PositionX`/`PositionY` (0x24).
     pub position: Option<(f32, f32)>,
-    /// `Position` (0x88) — вторая мировая позиция.
+    /// `Position` (0x88) — позиция в единицах симуляции.
     pub position_alt: Option<(f32, f32)>,
+    /// Поля класса `Trap`; `None`, если роль класса не назначена.
+    pub trap: Option<TrapFields>,
+    /// Поля класса `BoomTrap`; `None`, если роль класса не назначена.
+    pub boom: Option<BoomFields>,
+}
+
+/// Роль класса — то, чем пользователь заменяет недоступное имя типа.
+///
+/// Дальше 0x90 у разных классов лежат разные поля, а различить их нечем:
+/// в рантайме у нас есть только указатель на таблицу методов. Поэтому по
+/// умолчанию читается лишь общая часть, а всё остальное открывается ролью,
+/// назначенной вручную. Ошибка в роли — это неверные числа на экране, но
+/// не запись мимо цели: писать мы умеем только `Speed` и `CanTrigger`,
+/// и то лишь при роли [`TrapRole::Boom`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TrapRole {
+    /// Только поля `WorldObject` (до 0x90) — безопасно для любого класса.
+    #[default]
+    Base,
+    /// `Bloody_Trapland.WorldObjects.Trap`.
+    Trap,
+    /// `Bloody_Trapland.WorldObjects.BoomTrap`.
+    Boom,
+}
+
+impl TrapRole {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Base => "база",
+            Self::Trap => "Trap",
+            Self::Boom => "BoomTrap",
+        }
+    }
+}
+
+/// Поля, которые есть только у класса `Trap`.
+#[derive(Clone, Copy, Debug)]
+pub struct TrapFields {
+    /// `m_Bounding` (0xA4) — прямоугольник самой ловушки.
+    pub bounding: Option<Rect>,
+    /// `TextureSize` (0x94).
+    pub texture_size: Option<Rect>,
+}
+
+/// Поля, которые есть только у `BoomTrap`-подобных классов.
+///
+/// Читаются лишь для классов, помеченных пользователем: у базового `Trap`
+/// по этим же адресам лежит прямоугольник коллизии, и принимать его за
+/// координаты значило бы показывать заведомую чушь.
+///
+/// `Speed` сюда не входит: ползунок в интерфейсе читает и пишет его
+/// напрямую, и снимок кадровой давности только мешал бы ему.
+#[derive(Clone, Copy, Debug)]
+pub struct BoomFields {
+    /// `OriginalPosition` (0xB0).
+    pub original_position: Option<(f32, f32)>,
+    /// `PreviousPosition` (0xC8).
+    pub previous_position: Option<(f32, f32)>,
+    /// `SimulationPosition` (0xD0).
+    pub simulation_position: Option<(f32, f32)>,
 }
 
 /// Читает пару подряд лежащих `f32`, отбрасывая нечисла.
@@ -715,10 +819,13 @@ fn derive_sim_scale(traps: &[TrapRef]) -> f32 {
 /// 1. `m_Bounding` (0x50) — готовый прямоугольник коллизии прямо в пикселях
 ///    мира. Точнее всех, но заполнен только у элементов уровня; у собственно
 ///    ловушек остаётся нулевым;
-/// 2. `Position` (0x88), переведённая из единиц симуляции, плюс размер кадра
+/// 2. `Trap.m_Bounding` (0xA4) — такой же прямоугольник, но объявленный уже
+///    самой ловушкой. Только при роли [`TrapRole::Trap`]: у остальных классов
+///    по этому адресу либо другое поле, либо вообще конец объекта;
+/// 3. `Position` (0x88), переведённая из единиц симуляции, плюс размер кадра
 ///    (0x70). Размер кадра совпадает с размером объекта в мире — тайлы 48×48
 ///    и 48×96 это подтверждают;
-/// 3. `PositionX`/`PositionY` (0x24) с тем же размером. В снятой сборке эта
+/// 4. `PositionX`/`PositionY` (0x24) с тем же размером. В снятой сборке эта
 ///    пара везде нулевая, но она есть в раскладке и ничего не стоит.
 ///
 /// Обратите внимание, чего в списке нет: самого `m_Rectangle` как рамки.
@@ -729,22 +836,22 @@ fn derive_sim_scale(traps: &[TrapRef]) -> f32 {
 /// этого рамку потеряет, но такой объект и так несёт `m_Bounding` и будет
 /// пойман первым правилом, а вот незаполненное поле нулём притворяется
 /// постоянно — и именно оно собирало рамки в левом верхнем углу.
-fn world_rect(
-    bounding: Option<Rect>,
-    source: Option<Rect>,
-    position: Option<(f32, f32)>,
-    position_alt: Option<(f32, f32)>,
-    sim_scale: f32,
-) -> Option<RectF> {
-    if let Some(rect) = bounding.filter(|rect| rect.is_plausible_within(MAX_TRAP_DIMENSION)) {
+fn world_rect(item: &TrapRef, sim_scale: f32) -> Option<RectF> {
+    let plausible = |rect: &Rect| rect.is_plausible_within(MAX_TRAP_DIMENSION);
+
+    if let Some(rect) = item
+        .bounding_raw
+        .filter(plausible)
+        .or_else(|| item.trap.and_then(|trap| trap.bounding).filter(plausible))
+    {
         return Some(rect.into());
     }
 
-    let size = source.filter(|rect| rect.is_plausible_within(MAX_TRAP_DIMENSION))?;
+    let size = item.source_raw.filter(plausible)?;
     let non_zero = |&(x, y): &(f32, f32)| x != 0.0 || y != 0.0;
-    let (x, y) = match position_alt.filter(non_zero) {
+    let (x, y) = match item.position_alt.filter(non_zero) {
         Some((sim_x, sim_y)) => (sim_x * sim_scale, sim_y * sim_scale),
-        None => position.filter(non_zero)?,
+        None => item.position.filter(non_zero)?,
     };
     Some(RectF {
         x,
@@ -754,12 +861,46 @@ fn world_rect(
     })
 }
 
+/// Читает поля класса `Trap`.
+fn read_trap_fields(addr: usize) -> Option<TrapFields> {
+    if !mem::is_readable(addr, trap::TRAP_PROBE_SIZE) {
+        return None;
+    }
+    Some(TrapFields {
+        bounding: Rect::read(addr + trap::TRAP_BOUNDING),
+        texture_size: Rect::read(addr + trap::TRAP_TEXTURE_SIZE),
+    })
+}
+
+/// Читает поля класса `BoomTrap`.
+fn read_boom_fields(addr: usize) -> Option<BoomFields> {
+    if !mem::is_readable(addr, trap::BOOM_PROBE_SIZE) {
+        return None;
+    }
+    Some(BoomFields {
+        original_position: read_vector2(addr + trap::BOOM_ORIGINAL_POSITION),
+        previous_position: read_vector2(addr + trap::BOOM_PREVIOUS_POSITION),
+        simulation_position: read_vector2(addr + trap::BOOM_SIMULATION_POSITION),
+    })
+}
+
 /// Собирает ловушки уровня и возвращает применённый масштаб симуляции.
 ///
-/// Проход по списку двойной: масштаб выводится из тех объектов, у которых
-/// заполнены обе позиции, а применять его нужно ко всем — включая те, что
-/// встретились раньше донора.
-pub fn collect_traps(screen_addr: usize, out: &mut Vec<TrapRef>) -> f32 {
+/// `roles` — назначенные пользователем роли классов. Без роли читается
+/// только общая часть `WorldObject` (до 0x90): у `SPSpawn` объект на этом и
+/// заканчивается, у `QuickGoal` — чуть дальше, и чтение прямоугольника по
+/// 0xA4 у них залезло бы в соседний объект кучи. Оттуда охотно возвращается
+/// правдоподобная на вид рамка — так на экране и появлялись пустые квадраты
+/// в воздухе.
+///
+/// Проход по списку двойной: масштаб симуляции выводится из тех объектов, у
+/// которых заполнены обе позиции, а применять его нужно ко всем — включая
+/// те, что встретились раньше донора.
+pub fn collect_traps(
+    screen_addr: usize,
+    roles: &HashMap<usize, TrapRole>,
+    out: &mut Vec<TrapRef>,
+) -> f32 {
     out.clear();
     let Some(list_addr) = mem::read_ptr(screen_addr + screen::TRAP_LIST) else {
         return SIM_TO_DISPLAY_DEFAULT;
@@ -772,6 +913,7 @@ pub fn collect_traps(screen_addr: usize, out: &mut Vec<TrapRef>) -> f32 {
         let Some(class) = mem::read_ptr(addr + METHOD_TABLE) else {
             continue;
         };
+        let role = roles.get(&class).copied().unwrap_or_default();
         // Все источники сохраняются сырыми: интерфейс показывает их по
         // галочке «Показать рамки», и по ним видно, откуда взялась рамка.
         out.push(TrapRef {
@@ -782,24 +924,70 @@ pub fn collect_traps(screen_addr: usize, out: &mut Vec<TrapRef>) -> f32 {
             source_raw: Rect::read(addr + trap::SOURCE_RECT),
             position: read_vector2(addr + trap::POSITION_X),
             position_alt: read_vector2(addr + trap::POSITION),
+            trap: (role == TrapRole::Trap)
+                .then(|| read_trap_fields(addr))
+                .flatten(),
+            boom: (role == TrapRole::Boom)
+                .then(|| read_boom_fields(addr))
+                .flatten(),
         });
     }
 
     let sim_scale = derive_sim_scale(out);
     for item in out.iter_mut() {
-        item.rect = world_rect(
-            item.bounding_raw,
-            item.source_raw,
-            item.position,
-            item.position_alt,
-            sim_scale,
-        );
+        let rect = world_rect(item, sim_scale);
+        item.rect = rect;
     }
     sim_scale
 }
 
-pub fn trap_name(addr: usize) -> Option<String> {
-    mem::read_ptr(addr + trap::NAME).and_then(mem::read_dotnet_string)
+/// Имена, которыми игра сама подписывает объект.
+///
+/// Настоящего имени класса среди них нет и взяться ему неоткуда: у нас есть
+/// только указатель на таблицу методов, а вытаскивать имя типа означало бы
+/// разбирать внутренности CLR — раскладку `MethodTable` и `EEClass`, которая
+/// меняется от версии .NET к версии. Это же — обычные строковые поля объекта,
+/// и их достаточно, чтобы отличить пилу от блока земли.
+#[derive(Clone, Debug, Default)]
+pub struct TrapNames {
+    /// `<Name>` (0x20) — имя ассета: `Traps_Small3`, `Object_World5`.
+    pub name: String,
+    /// `<ObjectType>` (0x10) — категория объекта, если это строка.
+    pub object_type: String,
+    /// `<TextureName>` (0x0C).
+    pub texture: String,
+    /// `<ZoneName>` (0x1C).
+    pub zone: String,
+}
+
+impl TrapNames {
+    /// Что показывать в списке: самое конкретное из прочитанного.
+    pub fn label(&self) -> &str {
+        if !self.name.is_empty() {
+            &self.name
+        } else if !self.object_type.is_empty() {
+            &self.object_type
+        } else if !self.texture.is_empty() {
+            &self.texture
+        } else {
+            ""
+        }
+    }
+}
+
+fn read_string_field(addr: usize, offset: usize) -> String {
+    mem::read_ptr(addr + offset)
+        .and_then(mem::read_dotnet_string)
+        .unwrap_or_default()
+}
+
+pub fn trap_names(addr: usize) -> TrapNames {
+    TrapNames {
+        name: read_string_field(addr, trap::NAME),
+        object_type: read_string_field(addr, trap::OBJECT_TYPE),
+        texture: read_string_field(addr, trap::TEXTURE_NAME),
+        zone: read_string_field(addr, trap::ZONE_NAME),
+    }
 }
 
 /// Читает булево поле ловушки.
@@ -878,12 +1066,24 @@ mod tests {
         assert!(rect.is_plausible_within(MAX_TRAP_DIMENSION));
     }
 
-    /// Строка `Object_World5` из списка ловушек живой игры.
-    fn object_world5() -> TrapRef {
+    /// Ловушка без единого заполненного источника: тесты дополняют нужные.
+    fn blank_trap() -> TrapRef {
         TrapRef {
             addr: 0x2000,
             class: 0x2387_6C30,
             rect: None,
+            bounding_raw: None,
+            source_raw: None,
+            position: Some((0.0, 0.0)),
+            position_alt: Some((0.0, 0.0)),
+            trap: None,
+            boom: None,
+        }
+    }
+
+    /// Строка `Object_World5` из списка ловушек живой игры.
+    fn object_world5() -> TrapRef {
+        TrapRef {
             bounding_raw: Some(Rect {
                 x: 144,
                 y: 576,
@@ -897,26 +1097,58 @@ mod tests {
                 w: 48,
                 h: 48,
             }),
-            position: Some((0.0, 0.0)),
             position_alt: Some((1.44, 5.76)),
+            ..blank_trap()
         }
     }
 
     #[test]
     fn world_bounding_wins_over_the_texture_frame() {
-        let item = object_world5();
-        let rect = world_rect(
-            item.bounding_raw,
-            item.source_raw,
-            item.position,
-            item.position_alt,
-            100.0,
-        );
         assert_eq!(
-            rect,
+            world_rect(&object_world5(), 100.0),
             Some(RectF {
                 x: 144.0,
                 y: 576.0,
+                w: 48.0,
+                h: 48.0
+            })
+        );
+    }
+
+    /// У подвижной ловушки базовый `m_Bounding` пуст, а собственный —
+    /// заполнен; вторым правилом он и должен подхватываться.
+    #[test]
+    fn traps_own_bounding_is_used_when_the_inherited_one_is_empty() {
+        let item = TrapRef {
+            bounding_raw: Some(Rect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            }),
+            trap: Some(TrapFields {
+                bounding: Some(Rect {
+                    x: 1104,
+                    y: 624,
+                    w: 48,
+                    h: 48,
+                }),
+                texture_size: None,
+            }),
+            source_raw: Some(Rect {
+                x: 96,
+                y: 0,
+                w: 48,
+                h: 48,
+            }),
+            position_alt: Some((11.04, 6.24)),
+            ..blank_trap()
+        };
+        assert_eq!(
+            world_rect(&item, 100.0),
+            Some(RectF {
+                x: 1104.0,
+                y: 624.0,
                 w: 48.0,
                 h: 48.0
             })
@@ -957,14 +1189,13 @@ mod tests {
             w: 48,
             h: 96,
         };
-        let rect = world_rect(
-            Some(empty),
-            Some(source),
-            Some((0.0, 0.0)),
-            Some((8.16, 4.8)),
-            100.0,
-        )
-        .expect("рамка должна собраться из единиц симуляции");
+        let item = TrapRef {
+            bounding_raw: Some(empty),
+            source_raw: Some(source),
+            position_alt: Some((8.16, 4.8)),
+            ..blank_trap()
+        };
+        let rect = world_rect(&item, 100.0).expect("рамка должна собраться из единиц симуляции");
         // Точного равенства тут не бывает: 4.8 в двоичном виде не
         // представима, и после умножения выходит 480.00003.
         assert!((rect.x - 816.0).abs() < 0.01, "получили {}", rect.x);
@@ -980,14 +1211,15 @@ mod tests {
             w: 48,
             h: 48,
         };
-        let rect = world_rect(
-            None,
-            Some(source),
-            Some((240.0, 96.0)),
-            Some((0.0, 0.0)),
-            100.0,
+        let item = TrapRef {
+            source_raw: Some(source),
+            position: Some((240.0, 96.0)),
+            ..blank_trap()
+        };
+        assert_eq!(
+            world_rect(&item, 100.0).map(|rect| (rect.x, rect.y)),
+            Some((240.0, 96.0))
         );
-        assert_eq!(rect.map(|rect| (rect.x, rect.y)), Some((240.0, 96.0)));
     }
 
     #[test]
@@ -998,16 +1230,11 @@ mod tests {
             w: 48,
             h: 48,
         };
-        assert_eq!(
-            world_rect(
-                None,
-                Some(source),
-                Some((0.0, 0.0)),
-                Some((0.0, 0.0)),
-                100.0
-            ),
-            None
-        );
+        let item = TrapRef {
+            source_raw: Some(source),
+            ..blank_trap()
+        };
+        assert_eq!(world_rect(&item, 100.0), None);
     }
 
     #[test]

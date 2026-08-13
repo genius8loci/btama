@@ -17,7 +17,7 @@
 //!   ползунками: `Zoom`, `Cam X` и `Cam Y` остались лишь запасным путём на
 //!   случай, когда камера не читается.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 
 use hudhook::{ImguiRenderLoop, MessageFilter, RenderContext};
@@ -27,7 +27,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use crate::font;
-use crate::game::{self, Affine, CameraView, PlayerView, RectF, TrapRef, World};
+use crate::game::{self, Affine, CameraView, PlayerView, RectF, TrapRef, TrapRole, World};
 use crate::hook;
 use crate::log;
 use crate::offsets::trap;
@@ -65,6 +65,8 @@ struct PlayerConfig {
     jump_height: f32,
     override_gravity: bool,
     gravity: f32,
+    /// Снимать запрет на движение вбок, пока персонаж пригнулся.
+    crouch_walk: bool,
     /// Начальные значения подтягиваются из памяти ровно один раз, при первой
     /// встрече с игроком.
     seeded: bool,
@@ -215,13 +217,30 @@ fn game_has_focus() -> bool {
     // возвращаемым значением.
     unsafe {
         let window = GetForegroundWindow();
-        if window.0 == 0 {
+        if window.0.is_null() {
             return false;
         }
         let mut pid = 0u32;
         GetWindowThreadProcessId(window, Some(&mut pid));
         pid != 0 && pid == GetCurrentProcessId()
     }
+}
+
+/// Состояние конвейера, каким оно попало в лог в последний раз.
+///
+/// Умышленно без `objects`: их число меняется каждый кадр, и снимок с ним
+/// всегда считался бы новым.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Snapshot {
+    hooked: bool,
+    screen: usize,
+    players: usize,
+    traps: usize,
+    traps_with_rect: usize,
+    camera: Option<usize>,
+    from_matrix: bool,
+    sim_scale: i32,
+    display: (i32, i32),
 }
 
 /// Главный оверлей.
@@ -235,8 +254,9 @@ pub struct CheatOverlay {
     classes: Vec<(usize, usize)>,
 
     settings: HashMap<i32, PlayerConfig>,
-    /// Классы ловушек, которые пользователь пометил как `BoomTrap`.
-    boom_classes: HashSet<usize>,
+    /// Роли, назначенные пользователем классам ловушек. Отсутствие записи
+    /// означает [`TrapRole::Base`] — читать только общую часть.
+    roles: HashMap<usize, TrapRole>,
 
     keys: Keys,
     view: View,
@@ -249,6 +269,8 @@ pub struct CheatOverlay {
     /// Сколько пикселей мира в единице физического движка — выведено из
     /// самих ловушек, показывается в их окне.
     sim_scale: f32,
+    /// Последнее состояние, записанное в лог. См. [`CheatOverlay::report_state`].
+    reported: Snapshot,
     scan_timer: f32,
 
     menu_pinned: bool,
@@ -260,6 +282,8 @@ pub struct CheatOverlay {
     teleport: bool,
     /// Показывать сырые значения рамок в списке ловушек.
     show_trap_rects: bool,
+    /// Подписывать рамки ловушек именем объекта.
+    show_trap_labels: bool,
 }
 
 impl Default for CheatOverlay {
@@ -270,12 +294,13 @@ impl Default for CheatOverlay {
             traps: Vec::with_capacity(128),
             classes: Vec::with_capacity(16),
             settings: HashMap::new(),
-            boom_classes: HashSet::new(),
+            roles: HashMap::new(),
             keys: Keys::default(),
             view: View::default(),
             camera: None,
             transform: View::default().manual_transform(),
             sim_scale: 0.0,
+            reported: Snapshot::default(),
             scan_timer: 0.0,
             menu_pinned: false,
             menu_open: false,
@@ -284,6 +309,7 @@ impl Default for CheatOverlay {
             show_trap_menu: false,
             teleport: false,
             show_trap_rects: false,
+            show_trap_labels: false,
         }
     }
 }
@@ -382,11 +408,12 @@ impl CheatOverlay {
 
         // Ловушки читаются только когда действительно нужны.
         if world.screen != 0 && (self.show_trap_esp || self.show_trap_menu) {
-            self.sim_scale = game::collect_traps(world.screen, &mut self.traps);
+            self.sim_scale = game::collect_traps(world.screen, &self.roles, &mut self.traps);
         } else {
             self.traps.clear();
         }
         self.refresh_classes();
+        self.report_state(ui, &world);
 
         self.draw_esp(ui, &world);
         self.draw_main_window(ui, &world);
@@ -396,6 +423,59 @@ impl CheatOverlay {
         if self.menu_open {
             self.handle_teleport(ui, &world);
             draw_cursor(ui);
+        }
+    }
+
+    /// Пишет в лог состояние конвейера — но только когда оно изменилось.
+    ///
+    /// Строка в кадр забила бы файл за минуту и утонула бы в собственном
+    /// шуме. Поэтому сравнивается снимок из полей, которые внутри уровня
+    /// стоят на месте; число объектов от хука в него не входит — оно скачет
+    /// каждый кадр, — но в саму строку попадает.
+    fn report_state(&mut self, ui: &Ui, world: &World) {
+        let [width, height] = ui.io().display_size;
+        let snapshot = Snapshot {
+            hooked: hook::is_installed(),
+            screen: world.screen,
+            players: world.players.len(),
+            traps: self.traps.len(),
+            traps_with_rect: self.traps.iter().filter(|item| item.rect.is_some()).count(),
+            camera: self.camera.map(|camera| camera.addr),
+            from_matrix: self.camera.is_some_and(|camera| camera.from_matrix),
+            // Округляем: шум в последних разрядах не должен считаться
+            // изменением состояния.
+            sim_scale: self.sim_scale.round() as i32,
+            display: (width as i32, height as i32),
+        };
+        if snapshot == self.reported {
+            return;
+        }
+        self.reported = snapshot;
+
+        log::info!(
+            "состояние: хук={} экран=0x{:X} объектов={} игроков={} ловушек={} (с рамкой {}) \
+             камера={} масштаб={} окно={}x{}",
+            if snapshot.hooked { "да" } else { "нет" },
+            snapshot.screen,
+            self.objects.len(),
+            snapshot.players,
+            snapshot.traps,
+            snapshot.traps_with_rect,
+            match snapshot.camera {
+                Some(addr) if snapshot.from_matrix => format!("0x{addr:X} (m_Transform)"),
+                Some(addr) => format!("0x{addr:X} (собрана из полей)"),
+                None => "нет".to_string(),
+            },
+            snapshot.sim_scale,
+            snapshot.display.0,
+            snapshot.display.1,
+        );
+
+        if snapshot.traps_with_rect != snapshot.traps {
+            log::warning!(
+                "{} ловушек без пригодной рамки — ESP их не рисует",
+                snapshot.traps - snapshot.traps_with_rect
+            );
         }
     }
 
@@ -483,6 +563,20 @@ impl CheatOverlay {
                     .add_rect(top_left, bottom_right, color)
                     .thickness(1.0)
                     .build();
+
+                // Подпись отвечает на вопрос «что это за пустой квадрат»:
+                // у спавнов, финишей и зон нет спрайта, но имя есть.
+                if self.show_trap_labels {
+                    let name = game::trap_names(item.addr);
+                    let label = name.label();
+                    if !label.is_empty() {
+                        draw_list.add_text(
+                            [top_left[0], top_left[1] - ui.current_font_size()],
+                            color,
+                            label,
+                        );
+                    }
+                }
             }
         }
 
@@ -586,7 +680,7 @@ impl CheatOverlay {
             hook::force_retry();
         }
         if self.menu_open {
-            ui.text_colored(MUTED, format!("Лог: {}", crate::log::log_path().display()));
+            draw_log_location(ui);
         }
     }
 
@@ -606,6 +700,7 @@ impl CheatOverlay {
 
         self.draw_diagnostics(ui, world);
         self.draw_view_controls(ui);
+        draw_log_location(ui);
         ui.separator();
     }
 
@@ -739,6 +834,17 @@ impl CheatOverlay {
             ui.checkbox("God", &mut config.god_mode);
             ui.same_line();
             ui.checkbox("Inf Jump", &mut config.inf_jump);
+            ui.same_line();
+            ui.checkbox("Ходить в приседе", &mut config.crouch_walk);
+            if ui.is_item_hovered() {
+                ui.tooltip_text(
+                    "Взводит m_MovePlayerAnyhow (0x151), пока персонаж пригнулся.\n\
+                     Поле выбрано по имени — если не сработает, поищите нужный флаг\n\
+                     галочками ниже: они показывают и правят живые значения.",
+                );
+            }
+
+            draw_crouch_flags(ui, player.addr);
 
             slider_row(
                 ui,
@@ -788,6 +894,11 @@ impl CheatOverlay {
         if config.override_gravity {
             game::set_gravity(player.addr, config.gravity);
         }
+        // Только пока персонаж действительно пригнулся: держать флаг взведённым
+        // постоянно значило бы менять поведение и в обычной ходьбе.
+        if config.crouch_walk && game::is_crouching(player.addr) {
+            game::allow_crouch_movement(player.addr);
+        }
 
         if self.menu_open {
             ui.separator();
@@ -818,6 +929,8 @@ impl CheatOverlay {
                 ui.checkbox("Рисовать ESP ловушек", &mut self.show_trap_esp);
                 ui.same_line();
                 ui.checkbox("Показать рамки", &mut self.show_trap_rects);
+                ui.same_line();
+                ui.checkbox("Подписи", &mut self.show_trap_labels);
                 if ui.is_item_hovered() {
                     ui.tooltip_text(
                         "Сырые источники рамки по каждой ловушке:\n\
@@ -864,35 +977,59 @@ impl CheatOverlay {
 
     /// Классы ловушек и пометка «это BoomTrap».
     ///
-    /// Смещения `Speed` и `m_CanTrigger` совпадают со вторым `m_Bounding`
-    /// базового `Trap`, поэтому писать их можно только там, где класс
-    /// действительно их содержит. Определить это автоматически нельзя —
-    /// решает пользователь.
+    /// Раскладка объектов совпадает только до 0x90; дальше у `Trap`,
+    /// `BoomTrap`, `QuickGoal` и `SPSpawn` лежат разные поля, а у последних
+    /// двух объект там попросту заканчивается. Автоматически различить классы
+    /// нечем — имена типов в рантайме недоступны, — поэтому роль назначает
+    /// пользователь, и только она открывает чтение за 0x90.
     fn draw_trap_classes(&mut self, ui: &Ui) {
-        ui.text_colored(MUTED, "Классы (таблица методов x количество):");
+        ui.text_colored(MUTED, "Классы (таблица методов x количество и роль):");
         for &(class, count) in &self.classes {
             let _id = ui.push_id(class.to_string());
-            let mut marked = self.boom_classes.contains(&class);
-            if ui.checkbox(format!("0x{class:X} x{count}"), &mut marked) {
-                if marked {
-                    self.boom_classes.insert(class);
-                } else {
-                    self.boom_classes.remove(&class);
-                }
+            let mut role = self.roles.get(&class).copied().unwrap_or_default();
+            let before = role;
+
+            ui.text_colored(MUTED, format!("0x{class:X} x{count}"));
+            for candidate in [TrapRole::Base, TrapRole::Trap, TrapRole::Boom] {
+                ui.same_line();
+                ui.radio_button(candidate.label(), &mut role, candidate);
             }
             if ui.is_item_hovered() {
                 ui.tooltip_text(
-                    "Отметить, если это BoomTrap-подобный класс: откроет Speed (0xA4) и \
-                     CanTrigger (0xAC).\nУ обычного Trap по этим адресам лежит прямоугольник \
-                     коллизии — запись его испортит.",
+                    "база — только поля WorldObject (до 0x90), безопасно для любого класса;\n\
+                     Trap — плюс m_Bounding (0xA4) и TextureSize (0x94);\n\
+                     BoomTrap — плюс Speed (0xA4), CanTrigger (0xAC) и координаты движения.\n\n\
+                     Неверная роль даёт неверные числа: у SPSpawn объект кончается на 0x98,\n\
+                     и чтение по 0xA4 попадает уже в соседний объект кучи.",
                 );
+            }
+
+            if role != before {
+                self.roles.insert(class, role);
+                log::info!("класс 0x{class:X}: роль {}", role.label());
             }
         }
     }
 
     fn draw_trap_row(&mut self, ui: &Ui, index: usize, item: TrapRef) {
-        let name = game::trap_name(item.addr).unwrap_or_else(|| format!("Trap #{index}"));
-        highlighted_label(ui, &format!("{name:<20}"), color_for(item.addr));
+        let names = game::trap_names(item.addr);
+        let label = match names.label() {
+            "" => format!("Trap #{index}"),
+            label => label.to_string(),
+        };
+        highlighted_label(ui, &format!("{label:<20}"), color_for(item.addr));
+        if ui.is_item_hovered() {
+            ui.tooltip_text(format!(
+                "Name (0x20): {}\nObjectType (0x10): {}\nTextureName (0x0C): {}\nZoneName (0x1C): {}\n\
+                 Класс: 0x{:X}\nАдрес: 0x{:X}",
+                display_or_dash(&names.name),
+                display_or_dash(&names.object_type),
+                display_or_dash(&names.texture),
+                display_or_dash(&names.zone),
+                item.class,
+                item.addr,
+            ));
+        }
         ui.same_line();
 
         flag_checkbox(ui, "U", "Used", item.addr, trap::USED);
@@ -901,7 +1038,7 @@ impl CheatOverlay {
         ui.same_line();
         flag_checkbox(ui, "G", "GoreStick", item.addr, trap::GORE_STICK);
 
-        if self.boom_classes.contains(&item.class) && game::supports_boom_fields(item.addr) {
+        if item.boom.is_some() && game::supports_boom_fields(item.addr) {
             ui.same_line();
             flag_checkbox(
                 ui,
@@ -927,7 +1064,7 @@ impl CheatOverlay {
             }
         }
 
-        // Отдельной строкой в конце, чтобы не ломать выкладку кнопок выше.
+        // Отдельными строками в конце, чтобы не ломать выкладку кнопок выше.
         if self.show_trap_rects {
             ui.text_colored(
                 MUTED,
@@ -939,6 +1076,29 @@ impl CheatOverlay {
                     format_point(item.position_alt),
                 ),
             );
+            if let Some(fields) = item.trap {
+                ui.text_colored(
+                    MUTED,
+                    format!(
+                        "    Trap: 0xA4 рамка {} | 0x94 размер текстуры {}",
+                        format_rect(fields.bounding),
+                        format_rect(fields.texture_size),
+                    ),
+                );
+            }
+            // Координаты подвижной ловушки: по ним видно, какое из полей
+            // действительно едет вслед за ней, а какое стоит на месте спавна.
+            if let Some(boom) = item.boom {
+                ui.text_colored(
+                    MUTED,
+                    format!(
+                        "    Boom: 0xB0 старт {} | 0xC8 пред. {} | 0xD0 симуляция {}",
+                        format_point(boom.original_position),
+                        format_point(boom.previous_position),
+                        format_point(boom.simulation_position),
+                    ),
+                );
+            }
         }
     }
 }
@@ -977,10 +1137,61 @@ fn format_rect(rect: Option<game::Rect>) -> String {
 }
 
 /// Форматирует точку для диагностики.
+///
+/// Два знака после запятой, а не ноль: координаты в единицах симуляции —
+/// это единицы и десятые доли, и округление до целых прятало бы как раз то
+/// движение, ради которого их и смотрят.
 fn format_point(point: Option<(f32, f32)>) -> String {
     match point {
-        Some((x, y)) => format!("{x:.0},{y:.0}"),
+        Some((x, y)) => format!("{x:.2},{y:.2}"),
         None => "-".to_string(),
+    }
+}
+
+/// Живые флаги приседания: читаются и правятся прямо в памяти.
+///
+/// Нужны, потому что из дампа видно имена полей, но не то, какое из них игра
+/// проверяет перед тем, как не дать шагнуть. Строка с `m_Movement` рядом
+/// показывает, доходит ли до персонажа само перемещение.
+///
+/// Свободная функция, а не метод: вызывается там, где настройки игрока уже
+/// взяты в изменяемое заимствование, и `&self` конфликтовал бы с ним.
+fn draw_crouch_flags(ui: &Ui, addr: usize) {
+    ui.text_colored(MUTED, "Присед:");
+    for (label, offset) in game::CROUCH_FLAGS {
+        ui.same_line();
+        let Some(mut value) = game::player_flag(addr, offset) else {
+            ui.text_colored(MUTED, "-");
+            continue;
+        };
+        if ui.checkbox(label, &mut value) {
+            game::set_player_flag(addr, offset, value);
+            log::info!("флаг {label} (0x{offset:X}) = {value}");
+        }
+    }
+    ui.same_line();
+    match game::movement(addr) {
+        Some(movement) => ui.text_colored(MUTED, format!("m_Movement = {movement:.2}")),
+        None => ui.text_colored(MUTED, "m_Movement = ?"),
+    }
+}
+
+fn display_or_dash(value: &str) -> &str {
+    if value.is_empty() { "—" } else { value }
+}
+
+/// Куда пишется лог. Показывается всегда: пустой лог и лог, который не
+/// открылся, — разные диагнозы, и путать их не должно быть возможности.
+fn draw_log_location(ui: &Ui) {
+    let destination = log::status();
+    match (&destination.path, &destination.problem) {
+        (Some(path), _) => ui.text_colored(MUTED, format!("Лог: {}", path.display())),
+        (None, problem) => {
+            ui.text_colored(ALERT, "Файл лога не открылся, пишем только в отладчик");
+            if ui.is_item_hovered() {
+                ui.tooltip_text(problem.as_deref().unwrap_or("причина не записана"));
+            }
+        }
     }
 }
 

@@ -68,6 +68,14 @@ pub mod player {
     pub const GRAVITY_DEFAULT: usize = 0x10C;
     /// `gravityAmount` (f32).
     pub const GRAVITY: usize = 0x110;
+    /// `m_Movement` (f32) — горизонтальное перемещение за кадр.
+    pub const MOVEMENT: usize = 0x130;
+    /// `PlayerMove` (u8).
+    pub const PLAYER_MOVE: usize = 0x13C;
+    /// `allowInput` (u8).
+    pub const ALLOW_INPUT: usize = 0x13D;
+    /// `Crouching` (u8) — персонаж пригнулся, коллизия уменьшена.
+    pub const CROUCHING: usize = 0x141;
     /// `Alive` (u8) — сброс в 0 приводит к респавну.
     pub const ALIVE: usize = 0x142;
     /// `JumpBeenReleased` (u8).
@@ -76,12 +84,19 @@ pub mod player {
     pub const CAN_JUMP: usize = 0x144;
     /// `canDie` (u8).
     pub const CAN_DIE: usize = 0x150;
+    /// `m_MovePlayerAnyhow` (u8) — по имени похоже на «двигать персонажа
+    /// несмотря ни на что». Главный кандидат на снятие запрета ходить
+    /// в приседе, но именно кандидат: что игра делает с этим флагом на самом
+    /// деле, из дампа не видно, поэтому переключатель отдан пользователю.
+    pub const MOVE_ANYHOW: usize = 0x151;
     /// `isLocal` (u8).
     pub const IS_LOCAL: usize = 0x152;
+    /// `ForceCrouch` (u8) — присед, навязанный низким потолком.
+    pub const FORCE_CROUCH: usize = 0x153;
 
     /// Сколько байт объекта должно быть доступно для чтения, прежде чем
     /// трогать любое из полей выше.
-    pub const PROBE_SIZE: usize = IS_LOCAL + 1;
+    pub const PROBE_SIZE: usize = FORCE_CROUCH + 1;
 }
 
 /// `Bloody_Trapland.Screens.GameplayScreen` — базовый класс экрана.
@@ -113,24 +128,40 @@ pub mod screen {
     pub const IS_ONLINE: usize = 0xD1;
 }
 
-/// `Bloody_Trapland.WorldObjects.Trap` и его наследники.
+/// Элементы списка ловушек — `Bloody_Trapland.WorldObjects.*`.
 ///
-/// Всё до 0x90 принадлежит общему предку `TwoPlayGame.GameWorld.WorldObject`
-/// и потому одинаково у `Trap`, `BoomTrap`, `QuickGoal` и прочих элементов
-/// списка ловушек.
+/// # Общее только до 0x90
 ///
-/// # Почему 0xA4 и 0xAC вынесены отдельно
+/// Список объявлен как `List<Trap>`, но лежат в нём разные классы, и общий у
+/// них лишь предок `TwoPlayGame.GameWorld.WorldObject`. Дальше 0x90 раскладки
+/// расходятся полностью:
 ///
-/// У базового `Trap` по 0xA4..0xB0 лежит второй `m_Bounding` (4 × i32),
-/// а у наследника `BoomTrap` по тем же адресам — `Speed` (f32, 0xA4) и
-/// `m_CanTrigger` (u8, 0xAC). Прежняя версия писала туда `Speed`
-/// и `CanTrigger` для *любого* элемента списка ловушек и тем самым
-/// затирала прямоугольник коллизии у всех обычных ловушек.
+/// | Смещение | `Trap` | `BoomTrap` | `QuickGoal` | `SPSpawn` |
+/// |---|---|---|---|---|
+/// | 0x90 | `PlayerList` | `m_GameplayScreen` | `PlayerList` | — |
+/// | 0x94 | `TextureSize` (4×i32) | `m_TheCollidedObject` | `m_GameplayScreen` | — |
+/// | 0xA4 | `m_Bounding` (4×i32) | `Speed` (f32) | `spawnloc` (i32) | — |
+/// | 0xAC | (часть `m_Bounding`) | `m_CanTrigger` (u8) | за концом объекта | — |
 ///
-/// Поэтому эти два поля доступны только для классов, которые пользователь
-/// явно пометил как `BoomTrap` в интерфейсе; классы различаются по
-/// указателю на таблицу методов в [`METHOD_TABLE`].
+/// `SPSpawn` заканчивается на 0x98, `QuickGoal` — около 0xAB. Чтение
+/// четырёх `i32` по 0xA4 у них уходит **за пределы объекта**, в заголовок
+/// соседнего, и оттуда охотно возвращается «правдоподобный» прямоугольник:
+/// именно так на экране появлялись пустые рамки в воздухе и у самого края.
+///
+/// Поэтому всё, что за 0x90, читается только для классов, которым
+/// пользователь явно назначил роль в интерфейсе. Автоматически различить их
+/// нечем: имена типов в рантайме недоступны, есть только указатель на таблицу
+/// методов в [`METHOD_TABLE`].
 pub mod trap {
+    /// `<TextureName>k__BackingField` — указатель на `System.String`.
+    pub const TEXTURE_NAME: usize = 0x0C;
+    /// `<ObjectType>k__BackingField` — указатель на объект. Читается как
+    /// строка на пробу: если это `System.String`, получаем осмысленную
+    /// категорию объекта, если нет — проверка длины в `mem::read_dotnet_string`
+    /// отвергнет мусор.
+    pub const OBJECT_TYPE: usize = 0x10;
+    /// `<ZoneName>k__BackingField` — указатель на `System.String`.
+    pub const ZONE_NAME: usize = 0x1C;
     /// `<Name>k__BackingField` — указатель на `System.String`.
     pub const NAME: usize = 0x20;
     /// `<PositionX>k__BackingField` и `<PositionY>k__BackingField` (2 × f32) —
@@ -168,15 +199,36 @@ pub mod trap {
     /// Множитель выводится из этих же пар в `game::derive_sim_scale`.
     pub const POSITION: usize = 0x88;
 
-    /// `Speed` (f32) — **только** у `BoomTrap`-подобных классов.
+    /// `TextureSize` (4 × i32) — **только** у класса `Trap`.
+    pub const TRAP_TEXTURE_SIZE: usize = 0x94;
+    /// `m_Bounding` собственно `Trap` (4 × i32) — **только** у класса `Trap`.
+    ///
+    /// Это второй прямоугольник с тем же именем: первый (0x50) достался от
+    /// `WorldObject` и у ловушек обычно пуст. У подвижной ловушки именно этот
+    /// имеет шанс обновляться каждый кадр, тогда как [`POSITION`] может
+    /// остаться на месте спавна.
+    pub const TRAP_BOUNDING: usize = 0xA4;
+
+    /// `Speed` (f32) — **только** у `BoomTrap`.
+    /// Делит адрес с [`TRAP_BOUNDING`], потому и требует явной роли класса.
     pub const BOOM_SPEED: usize = 0xA4;
-    /// `m_CanTrigger` (u8) — **только** у `BoomTrap`-подобных классов.
+    /// `m_CanTrigger` (u8) — **только** у `BoomTrap`.
     pub const BOOM_CAN_TRIGGER: usize = 0xAC;
+    /// `OriginalPosition` (2 × f32) — где `BoomTrap` стоял до движения.
+    pub const BOOM_ORIGINAL_POSITION: usize = 0xB0;
+    /// `<PreviousPosition>k__BackingField` (2 × f32).
+    pub const BOOM_PREVIOUS_POSITION: usize = 0xC8;
+    /// `<SimulationPosition>k__BackingField` (2 × f32) — положение тела в
+    /// физическом движке. Кандидат номер один на роль живой координаты
+    /// подвижной ловушки.
+    pub const BOOM_SIMULATION_POSITION: usize = 0xD0;
 
     /// Достаточно для полей, общих для всех ловушек.
     pub const PROBE_SIZE: usize = POSITION + 2 * 4;
+    /// Достаточно для полей `Trap`.
+    pub const TRAP_PROBE_SIZE: usize = TRAP_BOUNDING + 4 * 4;
     /// Достаточно для полей `BoomTrap`.
-    pub const BOOM_PROBE_SIZE: usize = BOOM_CAN_TRIGGER + 1;
+    pub const BOOM_PROBE_SIZE: usize = BOOM_SIMULATION_POSITION + 2 * 4;
 }
 
 /// `TwoPlayGame.Cameras.Camera` — то, чем игра переводит мир в экран.

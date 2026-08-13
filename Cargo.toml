@@ -1,6 +1,6 @@
 [package]
 name = "btama"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 publish = false
 
@@ -9,7 +9,13 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Готовый DX9-оверлей с ImGui: избавляет от собственного хука EndScene.
-hudhook = { version = "0.7", features = ["dx9"] }
+#
+# Не ниже 0.8: в 0.7.1 вершинный буфер DX9 создавался размером
+# `capacity * size_of::<DrawVert>()` (20 байт), а заполнялся структурами
+# `CustomVertex` по 24 байта. Как только число вершин переваливало за пять
+# шестых ёмкости буфера, `Lock` возвращал ошибку и кадр не рисовался вовсе —
+# оверлей мигал и пропадал при прокрутке длинных списков.
+hudhook = { version = "0.9", features = ["dx9"] }
 imgui = "0.12"
 minhook-sys = "0.1"
 
@@ -17,11 +23,12 @@ minhook-sys = "0.1"
 # (VirtualQuery, GetAsyncKeyState) компилировалась только потому, что нужные
 # фичи включал hudhook, а Cargo их объединял — при смене его версии сборка
 # развалилась бы без единой правки в нашем коде.
-windows = { version = "0.54", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Debug",  # OutputDebugStringW
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",             # VirtualQuery и константы защиты страниц
+    "Win32_System_SystemInformation",  # GetLocalTime для меток времени в логе
     "Win32_System_SystemServices",     # DLL_PROCESS_ATTACH / DETACH
     "Win32_System_Threading",          # GetCurrentProcessId
     "Win32_UI_Input_KeyboardAndMouse", # GetAsyncKeyState
