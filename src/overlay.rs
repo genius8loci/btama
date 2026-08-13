@@ -16,11 +16,12 @@
 //! * список ловушек сгруппирован по классам: у объектов одного класса
 //!   совпадают и поля, и смысл, поэтому действие над одним осмысленно ровно
 //!   настолько же, насколько над всеми;
-//! * мировые координаты переводятся в экранные матрицей камеры игры, а не
-//!   ползунками: `Zoom`, `Cam X` и `Cam Y` остались лишь запасным путём на
-//!   случай, когда камера не читается.
+//! * мировые координаты переводятся в экранные матрицей камеры игры. Ручной
+//!   подгонки нет вовсе: у игры одно фиксированное разрешение, и настраивать
+//!   там было нечего, а промахнуться — было чем.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::panic::AssertUnwindSafe;
 
 use hudhook::{ImguiRenderLoop, MessageFilter, RenderContext};
@@ -136,37 +137,6 @@ impl PlayerConfig {
         self.jump_height.seed(jump_height);
         self.gravity.seed(gravity);
         self.seeded = true;
-    }
-}
-
-/// Откуда брать преобразование мировых координат в экранные.
-///
-/// По умолчанию — из камеры игры: её `m_Transform` и есть та матрица, с
-/// которой игра рисует кадр, так что ESP совпадает с картинкой сам собой.
-/// Ручные ползунки остались запасным путём на случай, если камера почему-то
-/// не читается (например, до входа в уровень).
-#[derive(Clone, Copy, Debug)]
-struct View {
-    follow_camera: bool,
-    zoom: f32,
-    camera_x: f32,
-    camera_y: f32,
-}
-
-impl Default for View {
-    fn default() -> Self {
-        Self {
-            follow_camera: true,
-            zoom: 0.833,
-            camera_x: 0.0,
-            camera_y: 0.0,
-        }
-    }
-}
-
-impl View {
-    fn manual_transform(self) -> Affine {
-        Affine::from_zoom_and_offset(self.zoom, self.camera_x, self.camera_y)
     }
 }
 
@@ -322,13 +292,12 @@ pub struct CheatOverlay {
     class_info: HashMap<usize, game::ClassInfo>,
 
     keys: Keys,
-    view: View,
     /// Камера, прочитанная в этом кадре; `None` — работаем по ползункам.
     camera: Option<CameraView>,
-    /// Преобразование, применяемое в этом кадре и к ESP, и к телепорту.
-    /// Пересчитывается в начале каждого кадра, поэтому обе стороны
-    /// заведомо согласованы между собой.
-    transform: Affine,
+    /// Преобразование мира в экран на этот кадр. `None` означает, что
+    /// камера не прочиталась: рисовать тогда нечего и незачем — рамки
+    /// в случайных местах хуже их отсутствия.
+    transform: Option<Affine>,
     /// Сколько пикселей мира в единице физического движка — выведено из
     /// самих ловушек, показывается в их окне.
     sim_scale: f32,
@@ -361,9 +330,8 @@ impl Default for CheatOverlay {
             settings: HashMap::new(),
             class_info: HashMap::new(),
             keys: Keys::default(),
-            view: View::default(),
             camera: None,
-            transform: View::default().manual_transform(),
+            transform: None,
             sim_scale: 0.0,
             reported: Snapshot::default(),
             scan_timer: 0.0,
@@ -552,21 +520,13 @@ impl CheatOverlay {
     /// заново строится список игроков: сборщик мусора двигает объекты, и
     /// адрес камеры с прошлого кадра ничего не гарантирует.
     fn refresh_transform(&mut self, ui: &Ui, world: &World) {
-        self.camera = self
-            .view
-            .follow_camera
-            .then(|| game::read_camera(world.screen))
-            .flatten();
-
-        self.transform = match self.camera {
-            Some(camera) => {
-                let [width, height] = ui.io().display_size;
-                camera
-                    .transform
-                    .fit_to_display(camera.viewport, (width, height))
-            }
-            None => self.view.manual_transform(),
-        };
+        self.camera = game::read_camera(world.screen);
+        let [width, height] = ui.io().display_size;
+        self.transform = self.camera.map(|camera| {
+            camera
+                .transform
+                .fit_to_display(camera.viewport, (width, height))
+        });
     }
 
     /// Телепорт персонажа в точку под курсором по правой кнопке.
@@ -585,8 +545,11 @@ impl CheatOverlay {
             return;
         };
 
+        let Some(transform) = self.transform else {
+            return;
+        };
         let [x, y] = ui.io().mouse_pos;
-        let (world_x, world_y) = self.transform.to_world(x, y);
+        let (world_x, world_y) = transform.to_world(x, y);
         if game::set_position(local.addr, world_x, world_y) {
             log::info!("телепорт в ({world_x:.0}, {world_y:.0})");
         }
@@ -618,6 +581,10 @@ impl CheatOverlay {
     // ------------------------------------------------------------------
 
     fn draw_esp(&self, ui: &Ui, world: &World) {
+        // Без камеры мир в экран не перевести, а рисовать наугад незачем.
+        let Some(transform) = self.transform else {
+            return;
+        };
         let draw_list = ui.get_background_draw_list();
 
         if self.show_trap_esp {
@@ -629,7 +596,7 @@ impl CheatOverlay {
                 // Тот же цвет, что и у фона названия в списке: так видно,
                 // какая рамка какой строке соответствует.
                 let color = rgba(color_for(item.addr), 0.85);
-                let (top_left, bottom_right) = self.project(rect);
+                let (top_left, bottom_right) = self.project(transform, rect);
                 draw_list
                     .add_rect(top_left, bottom_right, color)
                     .thickness(1.0)
@@ -662,7 +629,7 @@ impl CheatOverlay {
                 } else {
                     ImColor32::from_rgba(255, 0, 0, 150)
                 };
-                let (top_left, bottom_right) = self.project(rect.into());
+                let (top_left, bottom_right) = self.project(transform, rect.into());
                 draw_list
                     .add_rect(top_left, bottom_right, color)
                     .thickness(2.0)
@@ -678,9 +645,9 @@ impl CheatOverlay {
     /// было бы рисовать четырёхугольник. Игра камеру не поворачивает, так
     /// что осевой рамки достаточно, но `add_rect` требует упорядоченных
     /// углов — иначе рамка схлопывается.
-    fn project(&self, rect: RectF) -> ([f32; 2], [f32; 2]) {
-        let first = self.transform.to_screen(rect.x, rect.y);
-        let second = self.transform.to_screen(rect.x + rect.w, rect.y + rect.h);
+    fn project(&self, transform: Affine, rect: RectF) -> ([f32; 2], [f32; 2]) {
+        let first = transform.to_screen(rect.x, rect.y);
+        let second = transform.to_screen(rect.x + rect.w, rect.y + rect.h);
         (
             [first[0].min(second[0]), first[1].min(second[1])],
             [first[0].max(second[0]), first[1].max(second[1])],
@@ -711,6 +678,7 @@ impl CheatOverlay {
                     return;
                 }
 
+                self.draw_level_info(ui, world);
                 if self.menu_open {
                     self.draw_toolbar(ui, world);
                 }
@@ -771,68 +739,56 @@ impl CheatOverlay {
         ui.text_colored(MUTED, if self.menu_pinned { "[HOME]" } else { "[TAB]" });
 
         self.draw_diagnostics(ui, world);
-        self.draw_view_controls(ui);
         draw_log_location(ui);
         ui.separator();
     }
 
-    /// Управление преобразованием мира в экран.
+    /// Сводка по уровню: где мы, сколько идём и сколько раз умерли.
     ///
-    /// Пока камера читается, ползунки не показываются вовсе: они бы только
-    /// сбивали с толку — ни на что они в этом режиме не влияют.
-    fn draw_view_controls(&mut self, ui: &Ui) {
-        ui.checkbox("Камера игры", &mut self.view.follow_camera);
-        if ui.is_item_hovered() {
-            ui.tooltip_text(
-                "Брать преобразование из m_Transform камеры — той самой матрицы,\n\
-                 с которой игра рисует кадр.\n\
-                 Снимите, чтобы совместить рамки вручную.",
-            );
+    /// Показывается всегда, в том числе при свёрнутом меню — ради неё оно
+    /// в свёрнутом виде и существует.
+    fn draw_level_info(&self, ui: &Ui, world: &World) {
+        let local = world.players.iter().find(|player| player.is_local);
+        let info = game::read_level_info(world.screen, local.map(|player| player.addr));
+
+        // Имя карты у экрана бывает пустым между уровнями; тогда сгодится
+        // зона любого объекта — она хранит тот же идентификатор вида
+        // «Story/a_7».
+        let map = if info.map.is_empty() {
+            self.class_info
+                .values()
+                .map(|class| class.zone.as_str())
+                .find(|zone| !zone.is_empty())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            info.map.clone()
+        };
+
+        let mut line = String::with_capacity(96);
+        if !map.is_empty() {
+            line.push_str(&map);
+        }
+        if let (Some(world_index), Some(level)) = (info.world, info.level) {
+            let _ = write!(line, "  [{world_index}-{level}]");
+        }
+        if let Some(elapsed) = info.elapsed.filter(|value| value.is_finite()) {
+            let _ = write!(line, "  уровень {}", format_duration(elapsed));
+        }
+        if let Some(since_spawn) = info.since_spawn.filter(|value| value.is_finite()) {
+            let _ = write!(line, "  попытка {}", format_duration(since_spawn));
+        }
+        if let Some(deaths) = info.deaths.filter(|value| value.is_finite()) {
+            let _ = write!(line, "  смертей {}", deaths as i64);
+        }
+        if let Some(kills) = info.kills.filter(|value| value.is_finite() && *value > 0.0) {
+            let _ = write!(line, "  убийств {}", kills as i64);
         }
 
-        match self.camera {
-            Some(camera) => {
-                ui.same_line();
-                let source = if camera.from_matrix {
-                    "m_Transform"
-                } else {
-                    "зум + позиция"
-                };
-                ui.text_colored(
-                    MUTED,
-                    format!(
-                        "{source}: зум {:.3}, центр ({:.0}, {:.0}), вьюпорт {:.0}x{:.0}",
-                        camera.zoom,
-                        camera.position.0,
-                        camera.position.1,
-                        camera.viewport.0,
-                        camera.viewport.1
-                    ),
-                );
-            }
-            None => {
-                if self.view.follow_camera {
-                    ui.same_line();
-                    ui.text_colored(ALERT, "камера не читается, работают ползунки");
-                }
-
-                ui.set_next_item_width(90.0);
-                ui.slider("Zoom", 0.1, 3.0, &mut self.view.zoom);
-                ui.same_line();
-                if ui.button("Сброс") {
-                    self.view = View::default();
-                }
-
-                ui.set_next_item_width(90.0);
-                Drag::new("Cam X")
-                    .speed(1.0)
-                    .build(ui, &mut self.view.camera_x);
-                ui.same_line();
-                ui.set_next_item_width(90.0);
-                Drag::new("Cam Y")
-                    .speed(1.0)
-                    .build(ui, &mut self.view.camera_y);
-            }
+        if line.is_empty() {
+            ui.text_colored(MUTED, "Уровень не загружен");
+        } else {
+            ui.text_colored(MUTED, line);
         }
     }
 
@@ -915,8 +871,6 @@ impl CheatOverlay {
                      галочками ниже: они показывают и правят живые значения.",
                 );
             }
-
-            draw_crouch_flags(ui, player.addr);
 
             // Ползунки рисуются только при открытом меню, а применяются
             // всегда — значения хранит `config`, а не интерфейс.
@@ -1005,7 +959,7 @@ impl CheatOverlay {
                 ui.checkbox("Сырые поля", &mut self.show_raw_fields);
                 if ui.is_item_hovered() {
                     ui.tooltip_text(
-                        "Дамп 0x90..0x100 у первого объекта каждого класса.\n\
+                        "Дамп 0x90..0x140 у первого объекта каждого класса.\n\
                          Раскладка Spinner, Trampoline, TrapBlock и прочих новых типов\n\
                          не снята, гадать смещения и писать по ним нельзя — а прочитать\n\
                          и посмотреть глазами можно.",
@@ -1095,8 +1049,6 @@ ZoneName (0x1C): {}
         }
         ui.same_line();
 
-        group_flag(ui, "U", "Used", &addresses, trap::USED);
-        ui.same_line();
         group_flag(ui, "Up", "Updateable", &addresses, trap::UPDATEABLE);
         ui.same_line();
         group_flag(ui, "G", "GoreStick", &addresses, trap::GORE_STICK);
@@ -1223,40 +1175,6 @@ fn format_point(point: Option<(f32, f32)>) -> String {
     }
 }
 
-/// Живые флаги приседания: читаются и правятся прямо в памяти.
-///
-/// Нужны, потому что из дампа видно имена полей, но не то, какое из них игра
-/// проверяет перед тем, как не дать шагнуть. Строка с `m_Movement` рядом
-/// показывает, доходит ли до персонажа само перемещение.
-///
-/// Свободная функция, а не метод: вызывается там, где настройки игрока уже
-/// взяты в изменяемое заимствование, и `&self` конфликтовал бы с ним.
-fn draw_crouch_flags(ui: &Ui, addr: usize) {
-    ui.text_colored(MUTED, "Присед:");
-    for (label, offset, tooltip) in game::CROUCH_FLAGS {
-        ui.same_line();
-        let Some(mut value) = game::player_flag(addr, offset) else {
-            ui.text_colored(MUTED, "-");
-            continue;
-        };
-        if ui.checkbox(label, &mut value) {
-            game::set_player_flag(addr, offset, value);
-            log::info!("флаг {label} (0x{offset:X}) = {value}");
-        }
-        if ui.is_item_hovered() {
-            ui.tooltip_text(format!(
-                "0x{offset:X}
-{tooltip}"
-            ));
-        }
-    }
-    ui.same_line();
-    match game::move_speed(addr) {
-        Some(speed) => ui.text_colored(MUTED, format!("moveSpeed = {speed:.2}")),
-        None => ui.text_colored(MUTED, "moveSpeed = ?"),
-    }
-}
-
 /// Куда игрок просит идти — по тем же клавишам, что читает игра.
 ///
 /// Обе нажатые сразу дают ноль: в игре они складываются в противоположные
@@ -1321,18 +1239,25 @@ fn group_flag(ui: &Ui, label: &str, tooltip: &str, addresses: &[usize], offset: 
 
 /// Сырые поля объекта за общей частью `WorldObject`.
 ///
-/// Раскладки новых типов (`Spinner`, `Trampoline`, `TrapBlock`, `Weather`)
-/// у нас не сняты, а гадать смещения и писать по ним нельзя. Зато прочитать
-/// и показать — можно: по столбцу чисел видно, где скорость вращения, где
-/// счётчик, а где указатель. Только чтение, ничего не пишется.
+/// Раскладки большинства типов (`Spinner`, `SawBlade`, `Cannon`, `Rail`…)
+/// у нас не сняты. Вывести смещение из исходника нельзя: среда переставляет
+/// поля при укладке — в `WorldObject` приватные `m_Asset` и `m_Texture`
+/// оказались впереди всех автосвойств. А вот прочитать и показать столбцом
+/// можно, и по нему поле опознаётся глазами: скорость вращения `Spinner`
+/// по умолчанию 6.0, таймеры — доли секунды, размеры — круглые числа.
+///
+/// Только чтение; ничего не пишется.
 fn draw_raw_fields(ui: &Ui, addr: usize) {
-    /// Общая часть заканчивается здесь — дальше начинается своё у каждого типа.
+    /// Общая часть заканчивается здесь — дальше своё у каждого типа.
     const FROM: usize = 0x90;
-    /// Дальше этого заглядывать смысла нет: самый длинный известный класс,
-    /// `BoomTrap`, укладывается в 0xE0.
-    const TO: usize = 0x100;
+    /// Хватает с запасом: самый длинный известный класс, `BoomTrap`,
+    /// укладывается в 0xE0.
+    const TO: usize = 0x140;
+    /// По сколько значений в строке — иначе дамп не влезает в окно.
+    const PER_LINE: usize = 2;
 
-    for offset in (FROM..TO).step_by(4) {
+    let mut line = String::with_capacity(96);
+    for (index, offset) in (FROM..TO).step_by(4).enumerate() {
         let Some(raw) = crate::mem::read::<u32>(addr + offset) else {
             ui.text_colored(ALERT, format!("    +0x{offset:02X} недоступно"));
             return;
@@ -1341,18 +1266,30 @@ fn draw_raw_fields(ui: &Ui, addr: usize) {
         // Дробное показываем, только когда оно осмысленно: биты указателя,
         // прочитанные как float, дают числа вроде 1e-38 и только мешают.
         let as_float = if float.is_finite() && (float == 0.0 || float.abs() > 1e-3) {
-            format!(" f={float:.3}")
+            format!(" f={float:<10.3}")
         } else {
-            String::new()
+            " ".repeat(13)
         };
-        ui.text_colored(
-            MUTED,
-            format!(
-                "    +0x{offset:02X}  0x{raw:08X}  i={}{as_float}",
-                raw as i32
-            ),
-        );
+        let _ = write!(line, "  +0x{offset:02X} {:<11}{as_float}", raw as i32);
+
+        if index % PER_LINE == PER_LINE - 1 {
+            ui.text_colored(MUTED, &line);
+            line.clear();
+        }
     }
+    if !line.is_empty() {
+        ui.text_colored(MUTED, &line);
+    }
+}
+
+/// Секунды в вид `1:23.4` — минуты появляются только когда они есть.
+fn format_duration(seconds: f32) -> String {
+    let seconds = seconds.max(0.0);
+    let minutes = (seconds / 60.0) as i64;
+    if minutes == 0 {
+        return format!("{seconds:.1} c");
+    }
+    format!("{minutes}:{:04.1}", seconds - (minutes * 60) as f32)
 }
 
 /// Форматирует одиночное число для диагностики.
@@ -1404,46 +1341,29 @@ fn draw_cursor(ui: &Ui) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn manual_view_round_trips() {
-        let view = View {
-            follow_camera: false,
-            zoom: 0.833,
-            camera_x: 120.0,
-            camera_y: -45.0,
-        };
-        let transform = view.manual_transform();
-        let [screen_x, screen_y] = transform.to_screen(234.0, 588.0);
-        let (world_x, world_y) = transform.to_world(screen_x, screen_y);
-        assert!((world_x - 234.0).abs() < 0.01, "получили {world_x}");
-        assert!((world_y - 588.0).abs() < 0.01, "получили {world_y}");
-    }
-
-    #[test]
-    fn zero_zoom_does_not_produce_infinity() {
-        // Ползунок масштаба доходит до нуля, а телепорт делит на него.
-        let view = View {
-            follow_camera: false,
-            zoom: 0.0,
-            camera_x: 0.0,
-            camera_y: 0.0,
-        };
-        let (x, y) = view.manual_transform().to_world(100.0, 200.0);
-        assert!(x.is_finite() && y.is_finite());
-    }
-
     /// Отражённое преобразование дало бы `add_rect` углы в обратном порядке,
     /// и рамка схлопнулась бы в ничто.
     #[test]
     fn projection_orders_the_corners() {
-        let mut overlay = CheatOverlay::new();
-        overlay.transform = Affine::from_zoom_and_offset(-1.0, 0.0, 0.0);
-        let (top_left, bottom_right) = overlay.project(RectF {
-            x: 100.0,
-            y: 200.0,
-            w: 48.0,
-            h: 48.0,
-        });
+        let overlay = CheatOverlay::new();
+        // Зеркальное преобразование: масштаб отрицательный по обеим осям.
+        let mirrored = Affine {
+            m11: -1.0,
+            m12: 0.0,
+            m21: 0.0,
+            m22: -1.0,
+            m41: 0.0,
+            m42: 0.0,
+        };
+        let (top_left, bottom_right) = overlay.project(
+            mirrored,
+            RectF {
+                x: 100.0,
+                y: 200.0,
+                w: 48.0,
+                h: 48.0,
+            },
+        );
         assert!(top_left[0] < bottom_right[0] && top_left[1] < bottom_right[1]);
     }
 

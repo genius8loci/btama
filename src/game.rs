@@ -383,6 +383,42 @@ fn players_from_screen(screen_addr: usize) -> Vec<PlayerView> {
     collect_players(&player_lists(screen_addr))
 }
 
+/// Сводка по текущему уровню — то, что показывается в свёрнутом меню.
+#[derive(Clone, Debug, Default)]
+pub struct LevelInfo {
+    /// `MaptoLoad` экрана, иначе `ZoneName` любого объекта уровня.
+    pub map: String,
+    pub world: Option<i32>,
+    pub level: Option<i32>,
+    /// `m_GameTimer` экрана — секунды с начала уровня.
+    pub elapsed: Option<f32>,
+    /// `m_FinishTimer` игрока — секунды с последнего спавна.
+    pub since_spawn: Option<f32>,
+    pub deaths: Option<f32>,
+    pub kills: Option<f32>,
+}
+
+/// Собирает сводку по уровню.
+///
+/// Всё читается по отдельности и по отдельности же может не прочитаться:
+/// между уровнями экран пересоздаётся, и половина полей какое-то время
+/// бессмысленна. Пустые места интерфейс показывает прочерком, а не нулём —
+/// ноль здесь врал бы.
+pub fn read_level_info(screen_addr: usize, local: Option<usize>) -> LevelInfo {
+    if screen_addr == 0 {
+        return LevelInfo::default();
+    }
+    LevelInfo {
+        map: read_string_field(screen_addr, screen::MAP_TO_LOAD),
+        world: mem::read::<i32>(screen_addr + screen::CURRENT_WORLD),
+        level: mem::read::<i32>(screen_addr + screen::CURRENT_LEVEL),
+        elapsed: mem::read::<f32>(screen_addr + screen::GAME_TIMER),
+        since_spawn: local.and_then(|addr| mem::read::<f32>(addr + player::FINISH_TIMER)),
+        deaths: local.and_then(|addr| mem::read::<f32>(addr + player::DEATHS)),
+        kills: local.and_then(|addr| mem::read::<f32>(addr + player::KILLS)),
+    }
+}
+
 /// Сетевая ли сессия — по флагу `m_Online` экрана.
 pub fn is_online(screen_addr: usize) -> Option<bool> {
     if screen_addr == 0 {
@@ -419,19 +455,6 @@ pub struct Affine {
 }
 
 impl Affine {
-    /// Масштаб вокруг заданной точки — то, что раньше делали ползунки
-    /// `Zoom`, `Cam X` и `Cam Y`.
-    pub fn from_zoom_and_offset(zoom: f32, camera_x: f32, camera_y: f32) -> Self {
-        Self {
-            m11: zoom,
-            m12: 0.0,
-            m21: 0.0,
-            m22: zoom,
-            m41: -camera_x * zoom,
-            m42: -camera_y * zoom,
-        }
-    }
-
     /// Читает `Matrix` XNA по адресу и оставляет от неё двумерную часть.
     fn read(addr: usize) -> Option<Self> {
         let m = mem::read::<[f32; 16]>(addr)?;
@@ -521,8 +544,6 @@ pub struct CameraView {
     /// Взято ли оно из `m_Transform`. Ложь означает, что матрица оказалась
     /// непригодной и преобразование собрано из зума, позиции и вьюпорта.
     pub from_matrix: bool,
-    pub zoom: f32,
-    pub position: (f32, f32),
     pub viewport: (f32, f32),
 }
 
@@ -569,8 +590,6 @@ pub fn read_camera(screen_addr: usize) -> Option<CameraView> {
         addr,
         transform,
         from_matrix,
-        zoom,
-        position: (position_x, position_y),
         viewport,
     })
 }
@@ -629,49 +648,8 @@ pub fn respawn(addr: usize) -> bool {
     mem::write::<u8>(addr + player::ALIVE, 0)
 }
 
-/// Флаги состояния персонажа, полезные при разборе полётов.
-///
-/// Каждый снабжён пояснением из исходного кода игры — теперь он у нас есть,
-/// и гадать по именам больше не нужно.
-pub const CROUCH_FLAGS: [(&str, usize, &str); 5] = [
-    (
-        "Crouching",
-        player::CROUCHING,
-        "Пригнулся. HandleInput сбрасывает его каждый кадр и ставит заново\n\
-         по удержанию «вниз», так что удерживать его снаружи бесполезно.",
-    ),
-    (
-        "ForceCrouch",
-        player::FORCE_CROUCH,
-        "Присед, навязанный низким потолком. Ставится в Update по пересечению\n\
-         SmallBoundingBox с геометрией; если при этом некуда шагнуть — смерть\n\
-         от сдавливания.",
-    ),
-    (
-        "PlayerMove",
-        player::PLAYER_MOVE,
-        "Игрок сам нажал вбок в этом кадре. Только для выбора анимации.",
-    ),
-    (
-        "allowInput",
-        player::ALLOW_INPUT,
-        "Сбрасывается в Reset. На разбор ввода в этой версии не влияет.",
-    ),
-    (
-        "MoveAnyhow",
-        player::MOVE_ANYHOW,
-        "ОСТОРОЖНО: включённый m_MovePlayerAnyhow заставляет HandleInput\n\
-         пропустить весь разбор ввода — ни прыжка, ни приседа, ни движения.\n\
-         Игра пользуется им, когда ведёт персонажа сама (QuickGoal).",
-    ),
-];
-
-pub fn player_flag(addr: usize, offset: usize) -> Option<bool> {
+fn player_flag(addr: usize, offset: usize) -> Option<bool> {
     mem::read::<u8>(addr + offset).map(|value| value != 0)
-}
-
-pub fn set_player_flag(addr: usize, offset: usize, value: bool) -> bool {
-    mem::write::<u8>(addr + offset, u8::from(value))
 }
 
 /// Пригнулся ли персонаж прямо сейчас.
@@ -706,11 +684,6 @@ pub fn set_crouch_movement(addr: usize, direction: f32) -> bool {
         addr + player::MOVE_SPEED,
         direction * max * CROUCH_SPEED_HEADROOM,
     )
-}
-
-/// `moveSpeed` (0xF0) — та самая скорость, которой игра двигает персонажа.
-pub fn move_speed(addr: usize) -> Option<f32> {
-    mem::read::<f32>(addr + player::MOVE_SPEED)
 }
 
 pub fn set_speed(addr: usize, value: f32) -> bool {
@@ -1167,6 +1140,18 @@ pub fn set_trap_speed(addr: usize, value: f32) -> bool {
 mod tests {
     use super::*;
 
+    /// Чистое масштабирование — самая простая матрица, какую можно проверить.
+    fn scaling(zoom: f32) -> Affine {
+        Affine {
+            m11: zoom,
+            m12: 0.0,
+            m21: 0.0,
+            m22: zoom,
+            m41: 0.0,
+            m42: 0.0,
+        }
+    }
+
     #[test]
     fn unpacks_xna_color_as_rgba() {
         // 0xAABBGGRR: A=0x80, B=0x40, G=0x20, R=0x10
@@ -1506,19 +1491,19 @@ mod tests {
 
     #[test]
     fn degenerate_transforms_are_rejected() {
-        let zero = Affine::from_zoom_and_offset(0.0, 0.0, 0.0);
+        let zero = scaling(0.0);
         assert!(!zero.is_usable());
 
         let nan = Affine {
             m11: f32::NAN,
-            ..Affine::from_zoom_and_offset(1.0, 0.0, 0.0)
+            ..scaling(1.0)
         };
         assert!(!nan.is_usable());
     }
 
     #[test]
     fn fitting_to_an_equal_display_changes_nothing() {
-        let transform = Affine::from_zoom_and_offset(0.8333, 120.0, -45.0);
+        let transform = scaling(0.8333);
         assert_eq!(
             transform.fit_to_display((1280.0, 720.0), (1280.0, 720.0)),
             transform
@@ -1527,8 +1512,7 @@ mod tests {
 
     #[test]
     fn fitting_to_a_doubled_display_doubles_the_scale() {
-        let transform = Affine::from_zoom_and_offset(1.0, 0.0, 0.0);
-        let fitted = transform.fit_to_display((1280.0, 720.0), (2560.0, 1440.0));
+        let fitted = scaling(1.0).fit_to_display((1280.0, 720.0), (2560.0, 1440.0));
         assert_eq!(fitted.to_screen(100.0, 50.0), [200.0, 100.0]);
     }
 

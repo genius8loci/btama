@@ -81,12 +81,15 @@ pub mod player {
     /// значению (`JumpFloatDistanceTotal`, 6.0). Без его восстановления
     /// бесконечный прыжок срабатывал через раз.
     pub const JUMP_FLOAT_DISTANCE: usize = 0x124;
-    /// `PlayerMove` (u8).
-    pub const PLAYER_MOVE: usize = 0x13C;
-    /// `allowInput` (u8).
-    pub const ALLOW_INPUT: usize = 0x13D;
     /// `Crouching` (u8) — персонаж пригнулся, коллизия уменьшена.
     pub const CROUCHING: usize = 0x141;
+    /// `Kills` (f32) — да, счётчик хранится числом с плавающей точкой.
+    pub const KILLS: usize = 0xF8;
+    /// `Deaths` (f32).
+    pub const DEATHS: usize = 0xFC;
+    /// `m_FinishTimer` (f32) — секунды с момента спавна. Растёт в `Update`,
+    /// пока персонаж жив и не идёт обратный отсчёт; обнуляется в `Reset`.
+    pub const FINISH_TIMER: usize = 0x104;
     /// `Alive` (u8) — сброс в 0 приводит к респавну.
     pub const ALIVE: usize = 0x142;
     /// `JumpBeenReleased` (u8).
@@ -95,12 +98,6 @@ pub mod player {
     pub const CAN_JUMP: usize = 0x144;
     /// `canDie` (u8).
     pub const CAN_DIE: usize = 0x150;
-    /// `m_MovePlayerAnyhow` (u8).
-    ///
-    /// Имя обманчиво. Это не «двигать несмотря ни на что», а «персонажем
-    /// управляет игра»: взведённый флаг заставляет `HandleInput` пропустить
-    /// весь разбор ввода целиком — ни прыжка, ни приседа, ни шага.
-    pub const MOVE_ANYHOW: usize = 0x151;
     /// `isLocal` (u8).
     pub const IS_LOCAL: usize = 0x152;
     /// `ForceCrouch` (u8) — присед, навязанный низким потолком.
@@ -136,6 +133,14 @@ pub mod screen {
     /// `camera` — указатель на `TwoPlayGame.Cameras.Camera`.
     /// Раскладку см. в [`super::camera`].
     pub const CAMERA: usize = 0x4C;
+    /// `MaptoLoad` — указатель на `System.String` с именем карты.
+    pub const MAP_TO_LOAD: usize = 0x54;
+    /// `m_GameTimer` (f32) — секунды с начала уровня.
+    pub const GAME_TIMER: usize = 0x90;
+    /// `m_CurrentWorld` (i32).
+    pub const CURRENT_WORLD: usize = 0xA0;
+    /// `m_CurrentLevel` (i32).
+    pub const CURRENT_LEVEL: usize = 0xA4;
     /// `m_Online` (u8) — сетевая ли сессия.
     pub const IS_ONLINE: usize = 0xD1;
 }
@@ -187,11 +192,13 @@ pub mod trap {
     /// `<Rotation>k__BackingField` (f32) — поворот в радианах. У `Spinner`
     /// именно он и крутится.
     pub const ROTATION: usize = 0x30;
-    /// `Used` (u8).
-    pub const USED: usize = 0x44;
-    /// `Updateable` (u8).
+    /// `Updateable` (u8) — вызывает ли игра `Update` этого объекта.
+    ///
+    /// Самый действенный переключатель из всех: у `Spinner` в `Update` и
+    /// вращение, и проверка на убийство; у `TrapBlock` — тики шипов. Сняв
+    /// его, объект замирает целиком.
     pub const UPDATEABLE: usize = 0x45;
-    /// `GoreStick` (u8).
+    /// `GoreStick` (u8) — липнет ли к объекту кровь. Чистая косметика.
     pub const GORE_STICK: usize = 0x46;
     /// `m_Bounding` (4 × i32) — кэш свойства `Bounding`, в пикселях мира.
     ///
