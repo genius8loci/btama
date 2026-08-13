@@ -313,6 +313,16 @@ pub fn forget_cached_pointers() {
     LAST_LOCAL.store(0, Ordering::Relaxed);
 }
 
+/// Забывает и опознанный класс `Player` вдобавок к подсказкам.
+///
+/// Нужно при перезаводе хука: если игра пересоздала мир, а мы почему-то
+/// перестали его видеть, дешевле опознать класс заново, чем гадать, цел ли
+/// прежний эталон. Опознание стоит несколько кадров и самопроверяется.
+pub fn forget_everything() {
+    forget_cached_pointers();
+    PLAYER_CLASS.store(0, Ordering::Relaxed);
+}
+
 fn read_player(addr: usize) -> Option<PlayerView> {
     let [x, y] = mem::read::<[f32; 2]>(addr + player::POSITION)?;
     Some(PlayerView {
@@ -775,6 +785,20 @@ pub struct TrapTweak {
     pub min: f32,
     pub max: f32,
     pub tooltip: &'static str,
+    /// Поле, обязанное меняться следом, сохраняя своё отношение к этому.
+    pub linked: Option<LinkedField>,
+}
+
+/// Поле, привязанное к другому постоянным отношением.
+///
+/// Нужно там, где два числа описывают одно движение и врозь смысла не имеют.
+/// У пилы это ход по рельсам и скорость вращения: замедлив ход и оставив
+/// вращение прежним, получаешь пилу, которая ползёт и бешено крутится.
+pub struct LinkedField {
+    pub offset: usize,
+    /// Отношение связанного поля к основному, когда вывести его из самого
+    /// объекта не удалось.
+    pub default_ratio: f32,
 }
 
 /// Диапазоны выбраны вокруг значений по умолчанию из исходников: их видно
@@ -787,26 +811,28 @@ const SPINNER_TWEAKS: [TrapTweak; 1] = [TrapTweak {
     tooltip: "PendelSpeed (0x9C), радиан в секунду. По умолчанию 6.0.
               Ноль останавливает шип, отрицательное вращает назад.
               Зона поражения едет за рукой, так что ESP не соврёт.",
+    linked: None,
 }];
 
-const SAW_BLADE_TWEAKS: [TrapTweak; 2] = [
-    TrapTweak {
-        label: "Ход",
-        offset: trap_class::saw_blade::MOVE_SPEED,
-        min: 0.0,
-        max: 20.0,
-        tooltip: "Movespeed (0xA4) — скорость движения по рельсам.
-                  По умолчанию 3.0, ноль останавливает пилу на месте.",
-    },
-    TrapTweak {
-        label: "Оборот",
+/// Вращение отдельным ползунком не выведено намеренно: само по себе оно
+/// не значит ничего — на убийство не влияет, только крутит картинку. Смысл
+/// у него появляется лишь рядом с ходом, поэтому оно и привязано к нему.
+const SAW_BLADE_TWEAKS: [TrapTweak; 1] = [TrapTweak {
+    label: "Ход",
+    offset: trap_class::saw_blade::MOVE_SPEED,
+    min: 0.0,
+    max: 20.0,
+    tooltip: "Movespeed (0xA4) — скорость движения по рельсам, по умолчанию 3.0.
+              Вращение (RotationSpeed, 0xA0) меняется следом в той же пропорции:
+              при заводских 3 и 15 ход 1.0 даёт оборот 5.0.
+              Ноль останавливает пилу целиком.",
+    linked: Some(LinkedField {
         offset: trap_class::saw_blade::ROTATION_SPEED,
-        min: -60.0,
-        max: 60.0,
-        tooltip: "RotationSpeed (0xA0) — только вращение картинки.
-                  По умолчанию 15.0; на убийство не влияет никак.",
-    },
-];
+        // Заводские 15.0 к 3.0. Берётся, только если отношение не удалось
+        // снять с самого объекта — например, ход уже выкручен в ноль.
+        default_ratio: 5.0,
+    }),
+}];
 
 const CANNON_TWEAKS: [TrapTweak; 1] = [TrapTweak {
     label: "Перезарядка",
@@ -816,6 +842,7 @@ const CANNON_TWEAKS: [TrapTweak; 1] = [TrapTweak {
     tooltip: "fireDelayMaxTime (0xA0), секунды между выстрелами.
               По умолчанию 1.5. Меньше 0.1 не даём: пушка успевает
               перезаряжаться быстрее, чем снаряд улетает.",
+    linked: None,
 }];
 
 const TRACKER_TWEAKS: [TrapTweak; 1] = [TrapTweak {
@@ -825,6 +852,7 @@ const TRACKER_TWEAKS: [TrapTweak; 1] = [TrapTweak {
     max: 15.0,
     tooltip: "LockTimeWait (0xAC) — сколько пушка целится перед выстрелом.
               По умолчанию 1.0 с. Больше — успеваете уйти с линии огня.",
+    linked: None,
 }];
 
 const RPLATFORM_TWEAKS: [TrapTweak; 1] = [TrapTweak {
@@ -834,6 +862,7 @@ const RPLATFORM_TWEAKS: [TrapTweak; 1] = [TrapTweak {
     max: 20.0,
     tooltip: "Movespeed (0x98) — скорость платформы по рельсам.
               Обычно задаётся уровнем; ноль останавливает её на месте.",
+    linked: None,
 }];
 
 const THREADMILL_TWEAKS: [TrapTweak; 1] = [TrapTweak {
@@ -844,6 +873,7 @@ const THREADMILL_TWEAKS: [TrapTweak; 1] = [TrapTweak {
     tooltip: "velocity.X (0x9C) — что дорожка добавляет к скорости игрока.
               По умолчанию ±4 в зависимости от направления. Знак меняет
               направление, ноль превращает её в обычный пол.",
+    linked: None,
 }];
 
 const FAN_TWEAKS: [TrapTweak; 1] = [TrapTweak {
@@ -854,6 +884,7 @@ const FAN_TWEAKS: [TrapTweak; 1] = [TrapTweak {
     tooltip: "FanForce (0x98) — сила потока, по умолчанию 3.0.
               Задаёт и дальность: игра считает её от размера вентилятора
               умноженного на эту величину.",
+    linked: None,
 }];
 
 const TRAMPOLINE_TWEAKS: [TrapTweak; 1] = [TrapTweak {
@@ -863,6 +894,7 @@ const TRAMPOLINE_TWEAKS: [TrapTweak; 1] = [TrapTweak {
     max: 40.0,
     tooltip: "BounceSpeed (0x9C). По умолчанию 9.4; игра подбрасывает
               персонажа на -(BounceSpeed + 7.4).",
+    linked: None,
 }];
 
 impl TrapRole {
@@ -1186,9 +1218,47 @@ pub fn trap_tweak(addr: usize, role: TrapRole, tweak: &TrapTweak) -> Option<f32>
     mem::read::<f32>(addr + tweak.offset).filter(|value| value.is_finite())
 }
 
+/// Пишет параметр, а следом — привязанное к нему поле.
+///
+/// Отношение снимается с самого объекта прямо перед записью, а не берётся
+/// константой. Так сохраняется и то, что задал уровень: у пилы ход приходит
+/// из `DesignData`, а вращение всегда заводские 15, и отношение у каждой
+/// своё. Раз мы всегда пишем оба числа вместе, отношение не плывёт: новое
+/// равно старому по построению.
 pub fn set_trap_tweak(addr: usize, role: TrapRole, tweak: &TrapTweak, value: f32) -> bool {
-    mem::is_readable(addr, role.probe_size())
-        && mem::write::<f32>(addr + tweak.offset, value.clamp(tweak.min, tweak.max))
+    if !mem::is_readable(addr, role.probe_size()) {
+        return false;
+    }
+    let value = value.clamp(tweak.min, tweak.max);
+
+    if let Some(link) = &tweak.linked {
+        let paired = linked_value(
+            mem::read::<f32>(addr + tweak.offset),
+            mem::read::<f32>(addr + link.offset),
+            value,
+            link.default_ratio,
+        );
+        mem::write::<f32>(addr + link.offset, paired);
+    }
+
+    mem::write::<f32>(addr + tweak.offset, value)
+}
+
+/// Каким станет привязанное поле, когда основное станет `value`.
+///
+/// Отношение восстановимо, только пока основное поле ненулевое: выкрутив
+/// ход пилы в ноль, пропорцию из него уже не достать — тогда и берётся
+/// заводское отношение.
+fn linked_value(current: Option<f32>, linked: Option<f32>, value: f32, default_ratio: f32) -> f32 {
+    let ratio = match (current, linked) {
+        (Some(current), Some(linked))
+            if current.is_finite() && current.abs() > 0.01 && linked.is_finite() =>
+        {
+            linked / current
+        }
+        _ => default_ratio,
+    };
+    value * ratio
 }
 
 /// Читает поля класса `Trap`.
@@ -1641,6 +1711,31 @@ mod tests {
         )
         .expect("зона должна считаться");
         assert!((up.y - (500.0 - 16.0 - 100.0)).abs() < 0.01, "{}", up.y);
+    }
+
+    /// Пример из жизни: заводские ход 3.0 и оборот 15.0. Ход 1.0 обязан
+    /// дать оборот 5.0 — отношение сохраняется.
+    #[test]
+    fn linked_field_keeps_its_ratio() {
+        assert_eq!(linked_value(Some(3.0), Some(15.0), 1.0, 5.0), 5.0);
+        assert_eq!(linked_value(Some(3.0), Some(15.0), 6.0, 5.0), 30.0);
+    }
+
+    /// У пилы ход приходит из данных уровня, а оборот всегда заводской,
+    /// так что отношение у каждой своё — и брать надо именно её.
+    #[test]
+    fn linked_field_prefers_the_objects_own_ratio() {
+        // Ход 6.0 при обороте 15.0 — отношение 2.5, а не заводские 5.
+        assert_eq!(linked_value(Some(6.0), Some(15.0), 2.0, 5.0), 5.0);
+    }
+
+    /// Из нуля пропорцию не достать: делить на него нельзя, а «сколько было»
+    /// поле уже не помнит. Тогда и берётся заводское отношение.
+    #[test]
+    fn linked_field_falls_back_when_the_ratio_is_lost() {
+        assert_eq!(linked_value(Some(0.0), Some(15.0), 2.0, 5.0), 10.0);
+        assert_eq!(linked_value(None, None, 2.0, 5.0), 10.0);
+        assert_eq!(linked_value(Some(f32::NAN), Some(15.0), 2.0, 5.0), 10.0);
     }
 
     #[test]

@@ -52,6 +52,13 @@ const MOVE_RIGHT_KEYS: [i32; 2] = [0x27, 0x44];
 /// Пауза между попытками установить хук, секунды.
 const SCAN_INTERVAL: f32 = 3.0;
 
+/// Сколько секунд без единого игрока считать хук потерянным.
+///
+/// Пустой список игроков сам по себе ничего не значит: в меню и на загрузке
+/// игроков нет по делу. Значит он что-то, только если раньше они были —
+/// то есть мир пересоздался, а мы его больше не видим.
+const HOOK_SILENCE_LIMIT: f32 = 8.0;
+
 const ACCENT: [f32; 4] = [153.0 / 255.0, 102.0 / 255.0, 204.0 / 255.0, 1.0];
 const MUTED: [f32; 4] = [0.55, 0.55, 0.55, 1.0];
 const ALERT: [f32; 4] = [0.95, 0.45, 0.35, 1.0];
@@ -305,6 +312,11 @@ pub struct CheatOverlay {
     /// Адрес нашего персонажа на этот кадр. Нужен окну ловушек, которое
     /// рисуется отдельно от строки игрока.
     local_player: Option<usize>,
+    /// Секунды без единого игрока при стоящем хуке.
+    silence: f32,
+    /// Видели ли мы игроков после последней установки хука. Без этого
+    /// сторож срабатывал бы в главном меню, где игроков нет по делу.
+    saw_players: bool,
     /// Последнее состояние, записанное в лог. См. [`CheatOverlay::report_state`].
     reported: Snapshot,
     scan_timer: f32,
@@ -341,6 +353,8 @@ impl Default for CheatOverlay {
             transform: None,
             sim_scale: 0.0,
             local_player: None,
+            silence: 0.0,
+            saw_players: false,
             reported: Snapshot::default(),
             scan_timer: 0.0,
             menu_pinned: false,
@@ -447,6 +461,7 @@ impl CheatOverlay {
         }
 
         let world = game::build_world(&self.objects);
+        self.watch_hook(ui, &world);
         self.local_player = world
             .players
             .iter()
@@ -473,6 +488,47 @@ impl CheatOverlay {
             self.handle_teleport(ui, &world);
             draw_cursor(ui);
         }
+    }
+
+    /// Замечает потерю хука и заводит его заново.
+    ///
+    /// Пересоздание уровня само по себе хук не снимает: перехваченный метод
+    /// остаётся на месте, `INSTALLED` остаётся взведённым, и прежняя версия
+    /// поэтому даже не пробовала искать снова — она делала это только при
+    /// снятом хуке. Со стороны это выглядело как «всё пропало и не
+    /// возвращается».
+    ///
+    /// Признак потери — исчезнувшие игроки, а не пустой буфер объектов:
+    /// хук приносит только то, что двигалось, и стоящий на месте персонаж
+    /// в него не попадает. Требование «раньше игроки были» отсекает главное
+    /// меню, а сброс `saw_players` при перезаводе — повторные попытки, пока
+    /// уровень действительно не загрузится.
+    fn watch_hook(&mut self, ui: &Ui, world: &World) {
+        if !hook::is_installed() {
+            return;
+        }
+        if !world.players.is_empty() {
+            self.silence = 0.0;
+            self.saw_players = true;
+            return;
+        }
+        if !self.saw_players {
+            return;
+        }
+
+        self.silence += ui.io().delta_time;
+        if self.silence < HOOK_SILENCE_LIMIT {
+            return;
+        }
+
+        log::warning!("игроки не находятся {HOOK_SILENCE_LIMIT} с — заводим хук заново");
+        hook::uninstall();
+        game::forget_everything();
+        self.silence = 0.0;
+        self.saw_players = false;
+        // Счётчик неудач сбрасывается вместе с попыткой: прежние неудачи
+        // относились к прошлой жизни мира и на новую не влияют.
+        hook::force_retry();
     }
 
     /// Пишет в лог состояние конвейера — но только когда оно изменилось.
@@ -969,9 +1025,15 @@ impl CheatOverlay {
         // Текст до `##` — видимая часть заголовка, после — идентификатор
         // окна: он обязан пережить переименование, иначе ImGui забудет
         // положение и размер окна.
+        // Окно тянется по содержимому: список ловушек от уровня к уровню то
+        // в семь строк, то в тридцать, и любой заранее выбранный размер
+        // оказывался бы либо тесным, либо наполовину пустым. Свёрнутое окно
+        // при этом остаётся заголовком со стрелкой — авторазмер этому не
+        // мешает.
+        let flags = WindowFlags::ALWAYS_AUTO_RESIZE | WindowFlags::NO_NAV;
         ui.window(format!("{}##TrapManager", s::TRAP_MANAGER))
+            .flags(flags)
             .position([520.0, 20.0], Condition::FirstUseEver)
-            .size([520.0, 460.0], Condition::FirstUseEver)
             .build(|| {
                 ui.checkbox(s::DRAW_TRAP_ESP.get(), &mut self.show_trap_esp);
                 ui.same_line();
