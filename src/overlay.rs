@@ -301,6 +301,9 @@ pub struct CheatOverlay {
     /// Сколько пикселей мира в единице физического движка — выведено из
     /// самих ловушек, показывается в их окне.
     sim_scale: f32,
+    /// Адрес нашего персонажа на этот кадр. Нужен окну ловушек, которое
+    /// рисуется отдельно от строки игрока.
+    local_player: Option<usize>,
     /// Последнее состояние, записанное в лог. См. [`CheatOverlay::report_state`].
     reported: Snapshot,
     scan_timer: f32,
@@ -333,6 +336,7 @@ impl Default for CheatOverlay {
             camera: None,
             transform: None,
             sim_scale: 0.0,
+            local_player: None,
             reported: Snapshot::default(),
             scan_timer: 0.0,
             menu_pinned: false,
@@ -438,6 +442,11 @@ impl CheatOverlay {
         }
 
         let world = game::build_world(&self.objects);
+        self.local_player = world
+            .players
+            .iter()
+            .find(|player| player.is_local)
+            .map(|player| player.addr);
         self.refresh_transform(ui, &world);
 
         // Ловушки читаются только когда действительно нужны.
@@ -1043,6 +1052,11 @@ ZoneName (0x1C): {}
                         "WorldObject + Speed (0xA4), CanTrigger (0xAC), координаты движения",
                     TrapRole::Spinner =>
                         "WorldObject; зона поражения считается из позиции и поворота",
+                    TrapRole::SawBlade => "WorldObject + RotationSpeed (0xA0), Movespeed (0xA4)",
+                    TrapRole::Cannon => "WorldObject + fireDelayMaxTime (0xA0)",
+                    TrapRole::Trampoline => "WorldObject + BounceSpeed (0x9C)",
+                    TrapRole::QuickGoal =>
+                        "WorldObject + designWorld/designLevel (0x98/0x9C), spawnloc (0xA4)",
                 },
                 group.members.len(),
             ));
@@ -1081,6 +1095,9 @@ ZoneName (0x1C): {}
             }
         }
 
+        self.draw_class_tweaks(ui, item, &addresses);
+        self.draw_goal_button(ui, item);
+
         if self.show_trap_rects {
             for &member in &group.members {
                 self.draw_trap_numbers(ui, self.traps[member]);
@@ -1088,6 +1105,82 @@ ZoneName (0x1C): {}
         }
         if self.show_raw_fields {
             draw_raw_fields(ui, item.addr);
+        }
+    }
+
+    /// Ползунки параметров класса: скорость вращения, ход, перезарядка.
+    ///
+    /// Значение показывается по первому объекту группы, а пишется во все:
+    /// одинаковые ловушки на уровне обычно и настраивать хочется одинаково.
+    fn draw_class_tweaks(&self, ui: &Ui, item: TrapRef, addresses: &[usize]) {
+        for tweak in item.role.tweaks() {
+            let Some(mut value) = game::trap_tweak(item.addr, item.role, tweak) else {
+                continue;
+            };
+            ui.same_line();
+            ui.set_next_item_width(110.0);
+            if Drag::new(format!("{}##{}", tweak.label, tweak.offset))
+                .speed((tweak.max - tweak.min) * 0.005)
+                .range(tweak.min, tweak.max)
+                .build(ui, &mut value)
+            {
+                for &addr in addresses {
+                    game::set_trap_tweak(addr, item.role, tweak, value);
+                }
+            }
+            if ui.is_item_hovered() {
+                ui.tooltip_text(tweak.tooltip);
+            }
+        }
+    }
+
+    /// Кнопка перехода на уровень, куда ведёт этот `QuickGoal`.
+    ///
+    /// Уровень не «загружается» — персонаж ставится в центр перехода, и
+    /// дальше игра всё делает сама: затемнение, сохранение, достижения.
+    /// Иначе пришлось бы создавать `ScreenFadeEffect`, а создавать managed-
+    /// объекты извне мы не умеем.
+    fn draw_goal_button(&self, ui: &Ui, item: TrapRef) {
+        if item.role != TrapRole::QuickGoal {
+            return;
+        }
+        let Some(target) = game::read_goal_target(item.addr) else {
+            return;
+        };
+        let Some(rect) = item.rect else {
+            return;
+        };
+        let Some(local) = self.local_player else {
+            return;
+        };
+
+        ui.same_line();
+        if target.skipped {
+            ui.text_colored(MUTED, format!("→ {} (выключен)", target.label()));
+            return;
+        }
+        if ui.button(format!("→ {}##{:X}", target.label(), item.addr)) {
+            if game::walk_into_goal(local, rect) {
+                log::info!(
+                    "переход на {} (точка {:?}, вход {:?})",
+                    target.label(),
+                    target.spawn,
+                    target.direction
+                );
+            } else {
+                log::warning!("переход на {} не удался", target.label());
+            }
+        }
+        if ui.is_item_hovered() {
+            ui.tooltip_text(format!(
+                "Поставить персонажа в центр перехода.
+                 Мир {}, уровень {}, точка появления {:?}, вход {:?}.
+                 Дальше игра доводит переход сама.",
+                display_or_dash(&target.world),
+                display_or_dash(&target.level),
+                target.spawn,
+                target.direction,
+            ));
         }
     }
 

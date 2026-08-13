@@ -96,6 +96,9 @@ pub mod player {
     pub const JUMP_BEEN_RELEASED: usize = 0x143;
     /// `CanJump` (u8).
     pub const CAN_JUMP: usize = 0x144;
+    /// `CanWin` (u8) — взводится при приземлении. `QuickGoal` пропускает
+    /// игрока только когда он взведён либо когда игрок в воздухе.
+    pub const CAN_WIN: usize = 0x145;
     /// `canDie` (u8).
     pub const CAN_DIE: usize = 0x150;
     /// `isLocal` (u8).
@@ -308,3 +311,88 @@ pub mod camera {
 /// действительно живёт объект ожидаемого типа, и как идентификатор класса
 /// ловушки.
 pub const METHOD_TABLE: usize = 0x00;
+
+/// Поля отдельных классов ловушек — всё, что лежит за общей частью 0x90.
+///
+/// # Откуда взялись смещения
+///
+/// Среда переставляет поля при укладке, но не произвольно. По трём снятым
+/// раскладкам (`WorldObject`, `SawBlade`, `QuickGoal`) правило видно точно:
+/// поля сортируются по размеру — ссылки, затем четырёхбайтовые, затем
+/// однобайтовые, затем структуры, — а внутри каждой группы идут сначала
+/// обычные поля в порядке объявления, потом подложки автосвойств в порядке
+/// объявления свойств.
+///
+/// Проверка на `WorldObject`: ссылки `m_Asset`, `m_Texture` (обычные поля)
+/// заняли 0x04 и 0x08, за ними `TextureName`, `ObjectType`, `DesignData`,
+/// `Game`, `ZoneName`, `Name` (автосвойства) — 0x0C…0x20. Дальше 4-байтовые
+/// `PositionX`…`FadeOut` (0x24…0x40), однобайтовые `Used`, `Updateable`,
+/// `GoreStick` плюс автосвойства (0x44…0x4D) и наконец структуры
+/// `m_Bounding`, `PalleteBounding`, `m_Rectangle`, `m_Velocity`, `Position`
+/// (0x50…0x88). Совпало до последнего байта.
+///
+/// Числа ниже выведены этим правилом и **подтверждены значениями по
+/// умолчанию из исходников** — они видны в дампе сырых полей живой игры.
+pub mod trap_class {
+    /// `Bloody_Trapland.WorldObjects.Spinner`.
+    pub mod spinner {
+        /// `PendelSpeed` (f32) — радиан в секунду, по умолчанию 6.0.
+        pub const PENDEL_SPEED: usize = 0x9C;
+        /// До конца `CollisionRect` включительно.
+        pub const PROBE_SIZE: usize = 0xBC;
+    }
+
+    /// `Bloody_Trapland.WorldObjects.SawBlade`.
+    ///
+    /// Единственный класс, чью раскладку удалось сверить целиком: в дампе
+    /// по 0xA0 лежало `f=15.000`, по 0xA4 — `f=3.000`, ровно значения по
+    /// умолчанию `RotationSpeed = 15f` и `Movespeed = 3f`. Прямоугольник
+    /// `center` по 0xC0 оказался `403,323 8x8` — как и написано в коде,
+    /// восемь на восемь вокруг центра.
+    pub mod saw_blade {
+        /// `RotationSpeed` (f32) — только вид, на убийство не влияет.
+        pub const ROTATION_SPEED: usize = 0xA0;
+        /// `Movespeed` (f32) — скорость движения по рельсам.
+        pub const MOVE_SPEED: usize = 0xA4;
+        /// До конца `SimulationPosition`.
+        pub const PROBE_SIZE: usize = 0xE0;
+    }
+
+    /// `Bloody_Trapland.WorldObjects.Cannon`, наследник `BaseCannon`.
+    pub mod cannon {
+        // `FireDelayTimer` (0x9C) — сколько уже прошло с выстрела; крутить
+        // его смысла нет, игра перезапишет в том же кадре.
+        /// `fireDelayMaxTime` (f32) — сама перезарядка, по умолчанию 1.5 с.
+        pub const FIRE_DELAY_MAX: usize = 0xA0;
+        /// До конца `TextureSize`.
+        pub const PROBE_SIZE: usize = 0xB8;
+    }
+
+    /// `Bloody_Trapland.WorldObjects.Trampoline`.
+    pub mod trampoline {
+        /// `BounceSpeed` (f32) — по умолчанию 9.4; игра подбрасывает на
+        /// `-(BounceSpeed + 7.4)`.
+        pub const BOUNCE_SPEED: usize = 0x9C;
+        /// До конца `TextureSize`.
+        pub const PROBE_SIZE: usize = 0xB4;
+    }
+
+    /// `Bloody_Trapland.WorldObjects.QuickGoal` — переход между уровнями.
+    ///
+    /// Единственный класс, чью раскладку подтвердил ещё и дамп Cheat Engine
+    /// из `re/`: `designWorld`, `designLevel`, `direction` ссылками по
+    /// 0x98…0xA0, `spawnloc` числом по 0xA4, флаги — 0xA8…0xAA.
+    pub mod quick_goal {
+        /// `designWorld` — `System.String`, буква мира (`"a"`…`"f"`).
+        pub const DESIGN_WORLD: usize = 0x98;
+        /// `designLevel` — `System.String`, номер уровня.
+        pub const DESIGN_LEVEL: usize = 0x9C;
+        /// `direction` — `System.String`: `"up"`, `"down"`, …
+        pub const DIRECTION: usize = 0xA0;
+        /// `spawnloc` (i32) — точка появления на новом уровне.
+        pub const SPAWN_LOC: usize = 0xA4;
+        /// `SkipGoal` (u8) — переход отключён самой игрой.
+        pub const SKIP_GOAL: usize = 0xAA;
+        pub const PROBE_SIZE: usize = 0xAB;
+    }
+}

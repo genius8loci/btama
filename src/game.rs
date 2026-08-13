@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::mem;
 use crate::offsets::{
     METHOD_TABLE, MIN_VALID_ADDRESS, PTR_SIZE, camera as camera_fields, list, player, screen, trap,
+    trap_class,
 };
 
 /// Верхняя граница разумного размера рамки игрока в игровых единицах.
@@ -652,6 +653,10 @@ fn player_flag(addr: usize, offset: usize) -> Option<bool> {
     mem::read::<u8>(addr + offset).map(|value| value != 0)
 }
 
+fn set_player_flag(addr: usize, offset: usize, value: bool) -> bool {
+    mem::write::<u8>(addr + offset, u8::from(value))
+}
+
 /// Пригнулся ли персонаж прямо сейчас.
 pub fn is_crouching(addr: usize) -> bool {
     player_flag(addr, player::CROUCHING).unwrap_or(false)
@@ -751,9 +756,104 @@ pub enum TrapRole {
     Boom,
     /// `Bloody_Trapland.WorldObjects.Spinner` — шип на вращающейся руке.
     Spinner,
+    /// `Bloody_Trapland.WorldObjects.SawBlade` — пила, катающаяся по рельсам.
+    SawBlade,
+    /// `Bloody_Trapland.WorldObjects.Cannon`.
+    Cannon,
+    /// `Bloody_Trapland.WorldObjects.Trampoline`.
+    Trampoline,
+    /// `Bloody_Trapland.WorldObjects.QuickGoal` — переход на другой уровень.
+    QuickGoal,
 }
 
+/// Числовой параметр класса, который можно покрутить прямо в игре.
+pub struct TrapTweak {
+    pub label: &'static str,
+    pub offset: usize,
+    pub min: f32,
+    pub max: f32,
+    pub tooltip: &'static str,
+}
+
+/// Диапазоны выбраны вокруг значений по умолчанию из исходников: их видно
+/// в дампе сырых полей, и по ним же смещения и опознавались.
+const SPINNER_TWEAKS: [TrapTweak; 1] = [TrapTweak {
+    label: "Вращение",
+    offset: trap_class::spinner::PENDEL_SPEED,
+    min: -20.0,
+    max: 20.0,
+    tooltip: "PendelSpeed (0x9C), радиан в секунду. По умолчанию 6.0.
+              Ноль останавливает шип, отрицательное вращает назад.
+              Зона поражения едет за рукой, так что ESP не соврёт.",
+}];
+
+const SAW_BLADE_TWEAKS: [TrapTweak; 2] = [
+    TrapTweak {
+        label: "Ход",
+        offset: trap_class::saw_blade::MOVE_SPEED,
+        min: 0.0,
+        max: 20.0,
+        tooltip: "Movespeed (0xA4) — скорость движения по рельсам.
+                  По умолчанию 3.0, ноль останавливает пилу на месте.",
+    },
+    TrapTweak {
+        label: "Оборот",
+        offset: trap_class::saw_blade::ROTATION_SPEED,
+        min: -60.0,
+        max: 60.0,
+        tooltip: "RotationSpeed (0xA0) — только вращение картинки.
+                  По умолчанию 15.0; на убийство не влияет никак.",
+    },
+];
+
+const CANNON_TWEAKS: [TrapTweak; 1] = [TrapTweak {
+    label: "Перезарядка",
+    offset: trap_class::cannon::FIRE_DELAY_MAX,
+    min: 0.1,
+    max: 15.0,
+    tooltip: "fireDelayMaxTime (0xA0), секунды между выстрелами.
+              По умолчанию 1.5. Меньше 0.1 не даём: пушка успевает
+              перезаряжаться быстрее, чем снаряд улетает.",
+}];
+
+const TRAMPOLINE_TWEAKS: [TrapTweak; 1] = [TrapTweak {
+    label: "Подброс",
+    offset: trap_class::trampoline::BOUNCE_SPEED,
+    min: 0.0,
+    max: 40.0,
+    tooltip: "BounceSpeed (0x9C). По умолчанию 9.4; игра подбрасывает
+              персонажа на -(BounceSpeed + 7.4).",
+}];
+
 impl TrapRole {
+    /// Что у этого класса можно покрутить.
+    ///
+    /// Пусто у ролей, чьи поля мы не разбирали: молчание честнее, чем
+    /// ползунок по угаданному адресу.
+    pub fn tweaks(self) -> &'static [TrapTweak] {
+        match self {
+            Self::Spinner => &SPINNER_TWEAKS,
+            Self::SawBlade => &SAW_BLADE_TWEAKS,
+            Self::Cannon => &CANNON_TWEAKS,
+            Self::Trampoline => &TRAMPOLINE_TWEAKS,
+            _ => &[],
+        }
+    }
+
+    /// Сколько байт объекта должно читаться, чтобы трогать его поля.
+    fn probe_size(self) -> usize {
+        match self {
+            Self::Base => trap::PROBE_SIZE,
+            Self::Trap => trap::TRAP_PROBE_SIZE,
+            Self::Boom => trap::BOOM_PROBE_SIZE,
+            Self::Spinner => trap_class::spinner::PROBE_SIZE,
+            Self::SawBlade => trap_class::saw_blade::PROBE_SIZE,
+            Self::Cannon => trap_class::cannon::PROBE_SIZE,
+            Self::Trampoline => trap_class::trampoline::PROBE_SIZE,
+            Self::QuickGoal => trap_class::quick_goal::PROBE_SIZE,
+        }
+    }
+
     /// Выводит роль из строки `ObjectType`.
     ///
     /// Хвост после точки берётся на случай, если игра положит туда полное
@@ -771,6 +871,14 @@ impl TrapRole {
             Self::Trap
         } else if name.eq_ignore_ascii_case("Spinner") {
             Self::Spinner
+        } else if name.eq_ignore_ascii_case("SawBlade") {
+            Self::SawBlade
+        } else if name.eq_ignore_ascii_case("Cannon") {
+            Self::Cannon
+        } else if name.eq_ignore_ascii_case("Trampoline") {
+            Self::Trampoline
+        } else if name.eq_ignore_ascii_case("QuickGoal") {
+            Self::QuickGoal
         } else {
             Self::Base
         }
@@ -1010,6 +1118,82 @@ fn world_rect_from_parts(item: &TrapRef, sim_scale: f32) -> Option<RectF> {
         w: frame.w as f32 * scale,
         h: frame.h as f32 * scale,
     })
+}
+
+/// Читает настраиваемый параметр объекта.
+///
+/// `None` означает «не читается или выглядит бессмысленно» — тогда ползунок
+/// не показывается вовсе. Смещения выведены по правилу укладки и сверены со
+/// значениями по умолчанию, но проверка лишней не бывает: писать по адресу,
+/// с которого пришла бесконечность, нельзя.
+pub fn trap_tweak(addr: usize, role: TrapRole, tweak: &TrapTweak) -> Option<f32> {
+    if !mem::is_readable(addr, role.probe_size()) {
+        return None;
+    }
+    mem::read::<f32>(addr + tweak.offset).filter(|value| value.is_finite())
+}
+
+pub fn set_trap_tweak(addr: usize, role: TrapRole, tweak: &TrapTweak, value: f32) -> bool {
+    mem::is_readable(addr, role.probe_size())
+        && mem::write::<f32>(addr + tweak.offset, value.clamp(tweak.min, tweak.max))
+}
+
+/// Куда ведёт этот `QuickGoal`.
+#[derive(Clone, Debug, Default)]
+pub struct GoalTarget {
+    /// Мир и уровень назначения, как их хранит сама игра: `"a"` и `"5"`.
+    pub world: String,
+    pub level: String,
+    /// `direction` — с какой стороны игра ждёт входа.
+    pub direction: String,
+    pub spawn: Option<i32>,
+    /// `SkipGoal` — переход выключен самой игрой (мы уже дальше по сюжету).
+    pub skipped: bool,
+}
+
+impl GoalTarget {
+    pub fn label(&self) -> String {
+        if self.world.is_empty() && self.level.is_empty() {
+            return "?".to_string();
+        }
+        format!("{}_{}", self.world, self.level)
+    }
+}
+
+/// Читает назначение перехода.
+pub fn read_goal_target(addr: usize) -> Option<GoalTarget> {
+    if !mem::is_readable(addr, trap_class::quick_goal::PROBE_SIZE) {
+        return None;
+    }
+    Some(GoalTarget {
+        world: read_string_field(addr, trap_class::quick_goal::DESIGN_WORLD),
+        level: read_string_field(addr, trap_class::quick_goal::DESIGN_LEVEL),
+        direction: read_string_field(addr, trap_class::quick_goal::DIRECTION),
+        spawn: mem::read::<i32>(addr + trap_class::quick_goal::SPAWN_LOC),
+        skipped: mem::read::<u8>(addr + trap_class::quick_goal::SKIP_GOAL) == Some(1),
+    })
+}
+
+/// Ставит персонажа в центр перехода, чтобы игра сама увела его на уровень.
+///
+/// Своими силами уровень не сменить: `QuickGoal.CheckForWinner` создаёт
+/// `ScreenFadeEffect` — новый managed-объект, а создавать их извне мы не
+/// умеем. Зато условие входа простое, и выполнить его можно:
+///
+/// ```csharp
+/// Rectangle bounding = this.Bounding;
+/// bounding.Inflate(-4, -4);
+/// if (player.Bounding.Intersects(bounding)) {
+///     if (this.direction == "up") { if (player.CanWin && !player.InAir) ... }
+///     else if (player.CanWin || player.InAir) ...
+/// }
+/// ```
+///
+/// Ставим персонажа в центр рамки и взводим `CanWin` — дальше игра доводит
+/// переход сама, со своим затемнением, сохранением и достижениями.
+pub fn walk_into_goal(player_addr: usize, rect: RectF) -> bool {
+    set_player_flag(player_addr, player::CAN_WIN, true)
+        && set_position(player_addr, rect.x + rect.w * 0.5, rect.y + rect.h * 0.5)
 }
 
 /// Читает поля класса `Trap`.
@@ -1413,7 +1597,9 @@ mod tests {
     fn role_comes_from_the_object_type_string() {
         assert_eq!(TrapRole::from_object_type("BoomTrap"), TrapRole::Boom);
         assert_eq!(TrapRole::from_object_type("Trap"), TrapRole::Trap);
-        assert_eq!(TrapRole::from_object_type("QuickGoal"), TrapRole::Base);
+        assert_eq!(TrapRole::from_object_type("SawBlade"), TrapRole::SawBlade);
+        assert_eq!(TrapRole::from_object_type("QuickGoal"), TrapRole::QuickGoal);
+        // Тип, чью раскладку мы не разбирали, обязан остаться безопасным.
         assert_eq!(TrapRole::from_object_type("SPSpawn"), TrapRole::Base);
     }
 
