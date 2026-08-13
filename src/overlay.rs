@@ -35,6 +35,7 @@ use crate::game::{self, Affine, CameraView, PlayerView, RectF, TrapRef, TrapRole
 use crate::hook;
 use crate::log;
 use crate::offsets::trap;
+use crate::text::{self, Lang, s};
 
 const VK_TAB: i32 = 0x09;
 /// `HOME` — закрепляет меню.
@@ -89,7 +90,7 @@ impl Tweak {
             self.active = true;
         }
         ui.same_line();
-        if ui.button(format!("Сброс##{label}")) {
+        if ui.button(format!("{}##reset{label}", s::RESET)) {
             self.value = self.original;
             self.active = false;
             // Однократная запись: снявшись с фиксации, дальше мы молчим,
@@ -315,6 +316,9 @@ pub struct CheatOverlay {
     show_trap_menu: bool,
     /// Телепорт персонажа правой кнопкой мыши.
     teleport: bool,
+    /// Режим разработчика: путь лога, счётчики разбора, сырые поля и
+    /// числа рамок. Всё это нужно при поиске смещений и мешает в игре.
+    dev_mode: bool,
     /// Показывать сырые значения рамок в списке ловушек.
     show_trap_rects: bool,
     /// Подписывать рамки ловушек именем объекта.
@@ -345,6 +349,7 @@ impl Default for CheatOverlay {
             show_trap_esp: true,
             show_trap_menu: false,
             teleport: false,
+            dev_mode: false,
             show_trap_rects: false,
             show_trap_labels: false,
             show_raw_fields: false,
@@ -508,7 +513,7 @@ impl CheatOverlay {
             match snapshot.camera {
                 Some(addr) if snapshot.from_matrix => format!("0x{addr:X} (m_Transform)"),
                 Some(addr) => format!("0x{addr:X} (собрана из полей)"),
-                None => "нет".to_string(),
+                None => s::CAMERA_NONE.get().to_string(),
             },
             snapshot.sim_scale,
             snapshot.display.0,
@@ -693,7 +698,7 @@ impl CheatOverlay {
                 }
 
                 if world.players.is_empty() {
-                    ui.text_colored(MUTED, "Игроки не найдены");
+                    ui.text_colored(MUTED, s::NO_PLAYERS.get());
                     return;
                 }
 
@@ -706,25 +711,22 @@ impl CheatOverlay {
     fn draw_hook_status(&mut self, ui: &Ui) {
         match hook::status() {
             hook::Status::Installed => {}
-            hook::Status::Scanning => ui.text("Сканирование памяти..."),
+            hook::Status::Scanning => ui.text(s::SCANNING.get()),
             hook::Status::Idle | hook::Status::NotFound => {
-                ui.text_colored(MUTED, "Ожидание игры: метод ещё не вызывался");
+                ui.text_colored(MUTED, s::WAITING.get());
             }
             hook::Status::Ambiguous(count) => {
-                ui.text_colored(
-                    ALERT,
-                    format!("Сигнатура неоднозначна ({count} совпадений)"),
-                );
-                ui.text_colored(MUTED, "Хук не установлен намеренно, см. лог");
+                ui.text_colored(ALERT, format!("{} ({count})", s::AMBIGUOUS));
+                ui.text_colored(MUTED, s::AMBIGUOUS_HINT.get());
             }
             hook::Status::Failed(reason) => {
-                ui.text_colored(ALERT, format!("Ошибка MinHook: {reason}"));
+                ui.text_colored(ALERT, format!("{}: {reason}", s::HOOK_ERROR));
             }
             hook::Status::GaveUp => {
-                ui.text_colored(ALERT, "Сигнатура не найдена, попытки исчерпаны");
+                ui.text_colored(ALERT, s::GAVE_UP.get());
             }
         }
-        if self.menu_open && ui.button("Искать снова") {
+        if self.menu_open && ui.button(s::SEARCH_AGAIN.get()) {
             self.scan_timer = 0.0;
             hook::force_retry();
         }
@@ -734,21 +736,30 @@ impl CheatOverlay {
     }
 
     fn draw_toolbar(&mut self, ui: &Ui, world: &World) {
-        ui.checkbox("ESP", &mut self.show_esp);
+        ui.checkbox(s::ESP.get(), &mut self.show_esp);
         ui.same_line();
         if world.screen != 0 {
-            ui.checkbox("Ловушки", &mut self.show_trap_menu);
+            ui.checkbox(s::TRAPS.get(), &mut self.show_trap_menu);
             ui.same_line();
         }
-        ui.checkbox("Teleport", &mut self.teleport);
+        ui.checkbox(s::TELEPORT.get(), &mut self.teleport);
         if ui.is_item_hovered() {
-            ui.tooltip_text("ПКМ мимо окон — телепорт персонажа в точку под курсором");
+            ui.tooltip_text(s::TELEPORT_HINT.get());
         }
+        ui.same_line();
+        ui.checkbox(s::DEV.get(), &mut self.dev_mode);
+        if ui.is_item_hovered() {
+            ui.tooltip_text(s::DEV_HINT.get());
+        }
+        ui.same_line();
+        draw_language_switch(ui);
         ui.same_line();
         ui.text_colored(MUTED, if self.menu_pinned { "[HOME]" } else { "[TAB]" });
 
-        self.draw_diagnostics(ui, world);
-        draw_log_location(ui);
+        if self.dev_mode {
+            self.draw_diagnostics(ui, world);
+            draw_log_location(ui);
+        }
         ui.separator();
     }
 
@@ -782,20 +793,25 @@ impl CheatOverlay {
             let _ = write!(line, "  [{world_index}-{level}]");
         }
         if let Some(elapsed) = info.elapsed.filter(|value| value.is_finite()) {
-            let _ = write!(line, "  уровень {}", format_duration(elapsed));
+            let _ = write!(line, "  {} {}", s::LEVEL_TIME, format_duration(elapsed));
         }
         if let Some(since_spawn) = info.since_spawn.filter(|value| value.is_finite()) {
-            let _ = write!(line, "  попытка {}", format_duration(since_spawn));
+            let _ = write!(
+                line,
+                "  {} {}",
+                s::ATTEMPT_TIME,
+                format_duration(since_spawn)
+            );
         }
         if let Some(deaths) = info.deaths.filter(|value| value.is_finite()) {
-            let _ = write!(line, "  смертей {}", deaths as i64);
+            let _ = write!(line, "  {} {}", s::DEATHS, deaths as i64);
         }
         if let Some(kills) = info.kills.filter(|value| value.is_finite() && *value > 0.0) {
-            let _ = write!(line, "  убийств {}", kills as i64);
+            let _ = write!(line, "  {} {}", s::KILLS, kills as i64);
         }
 
         if line.is_empty() {
-            ui.text_colored(MUTED, "Уровень не загружен");
+            ui.text_colored(MUTED, s::NO_LEVEL.get());
         } else {
             ui.text_colored(MUTED, line);
         }
@@ -809,27 +825,32 @@ impl CheatOverlay {
     fn draw_diagnostics(&self, ui: &Ui, world: &World) {
         let class = match game::player_class() {
             Some(class) => format!("0x{class:X}"),
-            None => "не опознан".to_string(),
+            None => s::CLASS_UNKNOWN.get().to_string(),
         };
         let mode = match game::is_online(world.screen) {
-            Some(true) => "сеть",
-            Some(false) => "одиночная",
+            Some(true) => s::ONLINE.get(),
+            Some(false) => s::OFFLINE.get(),
             None => "?",
         };
         let camera = match self.camera {
             Some(camera) => format!("0x{:X}", camera.addr),
             None => match game::camera(world.screen) {
-                Some(addr) => format!("0x{addr:X} (не читается)"),
-                None => "нет".to_string(),
+                Some(addr) => format!("0x{addr:X} ({})", s::CAMERA_UNREADABLE),
+                None => s::CAMERA_NONE.get().to_string(),
             },
         };
         ui.text_colored(
             MUTED,
             format!(
-                "объектов: {} | класс: {class} | экран: 0x{:X} ({mode}) | камера: {camera} | ловушек: {}",
+                "{}: {} | {}: {class} | {}: 0x{:X} ({mode}) | {}: {camera} | {}: {}",
+                s::OBJECTS,
                 self.objects.len(),
+                s::CLASS,
+                s::SCREEN,
                 world.screen,
-                self.traps.len()
+                s::CAMERA,
+                s::TRAPS,
+                self.traps.len(),
             ),
         );
     }
@@ -852,7 +873,7 @@ impl CheatOverlay {
         if !player.is_local {
             if self.menu_open {
                 ui.same_line();
-                ui.text_colored(MUTED, "Remote");
+                ui.text_colored(MUTED, s::REMOTE.get());
                 ui.separator();
             }
             return;
@@ -864,36 +885,38 @@ impl CheatOverlay {
 
         if self.menu_open {
             ui.same_line();
-            if ui.button("Respawn") {
+            if ui.button(s::RESPAWN.get()) {
                 game::respawn(player.addr);
             }
 
-            ui.checkbox("God", &mut config.god_mode);
+            ui.checkbox(s::GOD.get(), &mut config.god_mode);
             ui.same_line();
-            ui.checkbox("Inf Jump", &mut config.inf_jump);
+            ui.checkbox(s::INF_JUMP.get(), &mut config.inf_jump);
             ui.same_line();
-            ui.checkbox("Ходить в приседе", &mut config.crouch_walk);
+            ui.checkbox(s::CROUCH_WALK.get(), &mut config.crouch_walk);
             if ui.is_item_hovered() {
-                ui.tooltip_text(
-                    "Взводит m_MovePlayerAnyhow (0x151), пока персонаж пригнулся.\n\
-                     Поле выбрано по имени — если не сработает, поищите нужный флаг\n\
-                     галочками ниже: они показывают и правят живые значения.",
-                );
+                ui.tooltip_text(s::CROUCH_WALK_HINT.get());
             }
 
             // Ползунки рисуются только при открытом меню, а применяются
             // всегда — значения хранит `config`, а не интерфейс.
-            if let Some(value) = config.speed.draw(ui, "Speed", 0.0, 400.0, stats.speed) {
+            if let Some(value) = config
+                .speed
+                .draw(ui, s::SPEED.get(), 0.0, 400.0, stats.speed)
+            {
                 game::set_speed(player.addr, value);
             }
             if let Some(value) =
                 config
                     .jump_height
-                    .draw(ui, "Jump H", 0.0, 100.0, stats.jump_height)
+                    .draw(ui, s::JUMP.get(), 0.0, 100.0, stats.jump_height)
             {
                 game::set_jump_height(player.addr, value);
             }
-            if let Some(value) = config.gravity.draw(ui, "Gravity", 0.0, 2.0, stats.gravity) {
+            if let Some(value) = config
+                .gravity
+                .draw(ui, s::GRAVITY.get(), 0.0, 2.0, stats.gravity)
+            {
                 game::set_gravity(player.addr, value);
             }
         }
@@ -946,48 +969,43 @@ impl CheatOverlay {
         // Текст до `##` — видимая часть заголовка, после — идентификатор
         // окна: он обязан пережить переименование, иначе ImGui забудет
         // положение и размер окна.
-        ui.window("Менеджер Ловушек##TrapManager")
+        ui.window(format!("{}##TrapManager", s::TRAP_MANAGER))
             .position([520.0, 20.0], Condition::FirstUseEver)
             .size([520.0, 460.0], Condition::FirstUseEver)
             .build(|| {
-                ui.checkbox("Рисовать ESP ловушек", &mut self.show_trap_esp);
+                ui.checkbox(s::DRAW_TRAP_ESP.get(), &mut self.show_trap_esp);
                 ui.same_line();
-                ui.checkbox("Показать рамки", &mut self.show_trap_rects);
-                if ui.is_item_hovered() {
-                    ui.tooltip_text(
-                        "Сырые источники рамки по каждому объекту класса:\n\
-                         поз — PositionX/PositionY (0x24), в этой сборке всегда 0;\n\
-                         0x50 — m_Bounding, коллизия в пикселях мира;\n\
-                         0x70 — m_Rectangle, кадр в атласе текстур (не мир!);\n\
-                         0x88 — Position в единицах физического движка.",
-                    );
-                }
-                ui.same_line();
-                ui.checkbox("Подписи", &mut self.show_trap_labels);
-                ui.same_line();
-                ui.checkbox("Сырые поля", &mut self.show_raw_fields);
-                if ui.is_item_hovered() {
-                    ui.tooltip_text(
-                        "Дамп 0x90..0x140 у первого объекта каждого класса.\n\
-                         Раскладка Spinner, Trampoline, TrapBlock и прочих новых типов\n\
-                         не снята, гадать смещения и писать по ним нельзя — а прочитать\n\
-                         и посмотреть глазами можно.",
-                    );
-                }
-                ui.text(format!(
-                    "Всего ловушек: {} | единица симуляции = {:.1} px",
-                    self.traps.len(),
-                    self.sim_scale
-                ));
-                let with_rect = self.traps.iter().filter(|item| item.rect.is_some()).count();
-                if with_rect != self.traps.len() {
-                    ui.text_colored(
-                        ALERT,
-                        format!(
-                            "Пригодная рамка есть только у {with_rect} из {} — остальные ESP не рисует",
-                            self.traps.len()
-                        ),
-                    );
+                ui.checkbox(s::LABELS.get(), &mut self.show_trap_labels);
+
+                if self.dev_mode {
+                    ui.same_line();
+                    ui.checkbox(s::SHOW_RECTS.get(), &mut self.show_trap_rects);
+                    if ui.is_item_hovered() {
+                        ui.tooltip_text(s::SHOW_RECTS_HINT.get());
+                    }
+                    ui.same_line();
+                    ui.checkbox(s::RAW_FIELDS.get(), &mut self.show_raw_fields);
+                    if ui.is_item_hovered() {
+                        ui.tooltip_text(s::RAW_FIELDS_HINT.get());
+                    }
+
+                    ui.text(format!(
+                        "{}: {} | {} = {:.1} px",
+                        s::TRAPS_TOTAL,
+                        self.traps.len(),
+                        s::SIM_UNIT,
+                        self.sim_scale
+                    ));
+                    let with_rect = self.traps.iter().filter(|item| item.rect.is_some()).count();
+                    if with_rect != self.traps.len() {
+                        ui.text_colored(
+                            ALERT,
+                            s::NO_RECT
+                                .get()
+                                .replace("{with}", &with_rect.to_string())
+                                .replace("{total}", &self.traps.len().to_string()),
+                        );
+                    }
                 }
                 ui.separator();
 
@@ -1029,50 +1047,65 @@ impl CheatOverlay {
             color_for(group.class),
         );
         ui.same_line();
-        ui.text_colored(MUTED, format!("{name:<20} x{}", group.members.len()));
+        if self.dev_mode {
+            ui.text_colored(
+                MUTED,
+                format!("{name:<20} x{:<3} 0x{:X}", group.members.len(), group.class),
+            );
+        } else {
+            ui.text_colored(MUTED, format!("{name:<20} x{}", group.members.len()));
+        }
         if ui.is_item_hovered() {
-            ui.tooltip_text(format!(
-                "ObjectType (0x10): {}
-Name (0x20): {}
-TextureName (0x0C): {}
-ZoneName (0x1C): {}
-                 Таблица методов: 0x{:X}
-
-Читаем поля: {}
-Объектов на уровне: {}",
-                display_or_dash(kind),
-                display_or_dash(name),
-                display_or_dash(info.map(|info| info.texture.as_str()).unwrap_or("")),
-                display_or_dash(info.map(|info| info.zone.as_str()).unwrap_or("")),
-                group.class,
-                match info.map(|info| info.role).unwrap_or_default() {
-                    TrapRole::Base => "только WorldObject, до 0x90",
-                    TrapRole::Trap => "WorldObject + m_Bounding (0xA4), TextureSize (0x94)",
-                    TrapRole::Boom =>
-                        "WorldObject + Speed (0xA4), CanTrigger (0xAC), координаты движения",
-                    TrapRole::Spinner =>
-                        "WorldObject; зона поражения считается из позиции и поворота",
-                    TrapRole::SawBlade => "WorldObject + RotationSpeed (0xA0), Movespeed (0xA4)",
-                    TrapRole::Cannon => "WorldObject + fireDelayMaxTime (0xA0)",
-                    TrapRole::Trampoline => "WorldObject + BounceSpeed (0x9C)",
-                    TrapRole::QuickGoal =>
-                        "WorldObject + designWorld/designLevel (0x98/0x9C), spawnloc (0xA4)",
-                },
-                group.members.len(),
-            ));
+            // Имена полей игры одинаковы на обоих языках: это её собственные
+            // идентификаторы, и переводить их значило бы обрывать связь
+            // с исходником.
+            let fields = match info.map(|info| info.role).unwrap_or_default() {
+                TrapRole::Base => "WorldObject only, up to 0x90",
+                TrapRole::Trap => "WorldObject + m_Bounding (0xA4), TextureSize (0x94)",
+                TrapRole::Boom => "WorldObject + Speed (0xA4), CanTrigger (0xAC)",
+                TrapRole::Spinner => "WorldObject + CollisionRect (computed)",
+                TrapRole::SawBlade => "WorldObject + RotationSpeed (0xA0), Movespeed (0xA4)",
+                TrapRole::Cannon => "WorldObject + fireDelayMaxTime (0xA0)",
+                TrapRole::Trampoline => "WorldObject + BounceSpeed (0x9C)",
+                TrapRole::Tracker => "WorldObject + LockTimeWait (0xAC)",
+                TrapRole::RPlatform => "WorldObject + Movespeed (0x98)",
+                TrapRole::Threadmill => "WorldObject + velocity (0x9C)",
+                TrapRole::Fan => "WorldObject + FanForce (0x98)",
+            };
+            ui.tooltip_text(
+                s::CLASS_TOOLTIP
+                    .get()
+                    .replace("{kind}", display_or_dash(kind))
+                    .replace("{name}", display_or_dash(name))
+                    .replace(
+                        "{texture}",
+                        display_or_dash(info.map(|info| info.texture.as_str()).unwrap_or("")),
+                    )
+                    .replace(
+                        "{zone}",
+                        display_or_dash(info.map(|info| info.zone.as_str()).unwrap_or("")),
+                    )
+                    .replace("0x{class:X}", &format!("0x{:X}", group.class))
+                    .replace("{fields}", fields)
+                    .replace("{count}", &group.members.len().to_string()),
+            );
         }
         ui.same_line();
 
-        group_flag(ui, "Up", "Updateable", &addresses, trap::UPDATEABLE);
-        ui.same_line();
-        group_flag(ui, "G", "GoreStick", &addresses, trap::GORE_STICK);
+        group_flag(
+            ui,
+            s::UPDATEABLE.get(),
+            s::UPDATEABLE_HINT.get(),
+            &addresses,
+            trap::UPDATEABLE,
+        );
 
         if item.boom.is_some() {
             ui.same_line();
             group_flag(
                 ui,
-                "T",
-                "CanTrigger (BoomTrap)",
+                s::CAN_TRIGGER.get(),
+                s::CAN_TRIGGER_HINT.get(),
                 &addresses,
                 trap::BOOM_CAN_TRIGGER,
             );
@@ -1090,20 +1123,19 @@ ZoneName (0x1C): {}
                     }
                 }
                 if ui.is_item_hovered() {
-                    ui.tooltip_text("Speed (BoomTrap) — пишется во все объекты класса");
+                    ui.tooltip_text(s::BOOM_SPEED_HINT.get());
                 }
             }
         }
 
         self.draw_class_tweaks(ui, item, &addresses);
-        self.draw_goal_button(ui, item);
 
-        if self.show_trap_rects {
+        if self.dev_mode && self.show_trap_rects {
             for &member in &group.members {
                 self.draw_trap_numbers(ui, self.traps[member]);
             }
         }
-        if self.show_raw_fields {
+        if self.dev_mode && self.show_raw_fields {
             draw_raw_fields(ui, item.addr);
         }
     }
@@ -1131,56 +1163,6 @@ ZoneName (0x1C): {}
             if ui.is_item_hovered() {
                 ui.tooltip_text(tweak.tooltip);
             }
-        }
-    }
-
-    /// Кнопка перехода на уровень, куда ведёт этот `QuickGoal`.
-    ///
-    /// Уровень не «загружается» — персонаж ставится в центр перехода, и
-    /// дальше игра всё делает сама: затемнение, сохранение, достижения.
-    /// Иначе пришлось бы создавать `ScreenFadeEffect`, а создавать managed-
-    /// объекты извне мы не умеем.
-    fn draw_goal_button(&self, ui: &Ui, item: TrapRef) {
-        if item.role != TrapRole::QuickGoal {
-            return;
-        }
-        let Some(target) = game::read_goal_target(item.addr) else {
-            return;
-        };
-        let Some(rect) = item.rect else {
-            return;
-        };
-        let Some(local) = self.local_player else {
-            return;
-        };
-
-        ui.same_line();
-        if target.skipped {
-            ui.text_colored(MUTED, format!("→ {} (выключен)", target.label()));
-            return;
-        }
-        if ui.button(format!("→ {}##{:X}", target.label(), item.addr)) {
-            if game::walk_into_goal(local, rect) {
-                log::info!(
-                    "переход на {} (точка {:?}, вход {:?})",
-                    target.label(),
-                    target.spawn,
-                    target.direction
-                );
-            } else {
-                log::warning!("переход на {} не удался", target.label());
-            }
-        }
-        if ui.is_item_hovered() {
-            ui.tooltip_text(format!(
-                "Поставить персонажа в центр перехода.
-                 Мир {}, уровень {}, точка появления {:?}, вход {:?}.
-                 Дальше игра доводит переход сама.",
-                display_or_dash(&target.world),
-                display_or_dash(&target.level),
-                target.spawn,
-                target.direction,
-            ));
         }
     }
 
@@ -1315,17 +1297,9 @@ fn group_flag(ui: &Ui, label: &str, tooltip: &str, addresses: &[usize], offset: 
     }
     if ui.is_item_hovered() {
         ui.tooltip_text(if mixed {
-            format!(
-                "{tooltip}
-Значения в группе разошлись — клик выровняет все {}",
-                addresses.len()
-            )
+            format!("{tooltip}\n{} ({})", s::GROUP_MIXED, addresses.len())
         } else {
-            format!(
-                "{tooltip}
-Пишется во все объекты класса ({})",
-                addresses.len()
-            )
+            format!("{tooltip}\n{} ({})", s::GROUP_ALIGNED, addresses.len())
         });
     }
 }
@@ -1352,7 +1326,7 @@ fn draw_raw_fields(ui: &Ui, addr: usize) {
     let mut line = String::with_capacity(96);
     for (index, offset) in (FROM..TO).step_by(4).enumerate() {
         let Some(raw) = crate::mem::read::<u32>(addr + offset) else {
-            ui.text_colored(ALERT, format!("    +0x{offset:02X} недоступно"));
+            ui.text_colored(ALERT, format!("    +0x{offset:02X} {}", s::UNAVAILABLE));
             return;
         };
         let float = f32::from_bits(raw);
@@ -1380,7 +1354,7 @@ fn format_duration(seconds: f32) -> String {
     let seconds = seconds.max(0.0);
     let minutes = (seconds / 60.0) as i64;
     if minutes == 0 {
-        return format!("{seconds:.1} c");
+        return format!("{seconds:.1} {}", s::SECONDS);
     }
     format!("{minutes}:{:04.1}", seconds - (minutes * 60) as f32)
 }
@@ -1397,16 +1371,40 @@ fn display_or_dash(value: &str) -> &str {
     if value.is_empty() { "—" } else { value }
 }
 
+/// Переключатель языка интерфейса.
+///
+/// Две кнопки, а не выпадающий список: языка ровно два, и выбранный виден
+/// без раскрытия. Смена языка меняет и подписи виджетов, но состояние всего,
+/// что мы показываем, хранится у нас, а не в ImGui, — так что перерисовка
+/// на другом языке ничего не теряет.
+fn draw_language_switch(ui: &Ui) {
+    let current = text::current();
+    for (lang, label) in [(Lang::Ru, "RU"), (Lang::En, "EN")] {
+        ui.same_line();
+        let active = current == lang;
+        let _color = active.then(|| ui.push_style_color(StyleColor::Button, ACCENT));
+        if ui.button(label) {
+            text::set(lang);
+            log::info!("язык интерфейса: {label}");
+        }
+        // Подсказка внутри цикла, а не после него: снаружи `is_item_hovered`
+        // отвечал бы только за последнюю кнопку.
+        if ui.is_item_hovered() {
+            ui.tooltip_text(s::LANGUAGE_HINT.get());
+        }
+    }
+}
+
 /// Куда пишется лог. Показывается всегда: пустой лог и лог, который не
 /// открылся, — разные диагнозы, и путать их не должно быть возможности.
 fn draw_log_location(ui: &Ui) {
     let destination = log::status();
     match (&destination.path, &destination.problem) {
-        (Some(path), _) => ui.text_colored(MUTED, format!("Лог: {}", path.display())),
+        (Some(path), _) => ui.text_colored(MUTED, format!("{}: {}", s::LOG_AT, path.display())),
         (None, problem) => {
-            ui.text_colored(ALERT, "Файл лога не открылся, пишем только в отладчик");
+            ui.text_colored(ALERT, s::LOG_FAILED.get());
             if ui.is_item_hovered() {
-                ui.tooltip_text(problem.as_deref().unwrap_or("причина не записана"));
+                ui.tooltip_text(problem.as_deref().unwrap_or(s::LOG_NO_REASON.get()));
             }
         }
     }

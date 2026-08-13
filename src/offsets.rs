@@ -96,9 +96,6 @@ pub mod player {
     pub const JUMP_BEEN_RELEASED: usize = 0x143;
     /// `CanJump` (u8).
     pub const CAN_JUMP: usize = 0x144;
-    /// `CanWin` (u8) — взводится при приземлении. `QuickGoal` пропускает
-    /// игрока только когда он взведён либо когда игрок в воздухе.
-    pub const CAN_WIN: usize = 0x145;
     /// `canDie` (u8).
     pub const CAN_DIE: usize = 0x150;
     /// `isLocal` (u8).
@@ -201,8 +198,6 @@ pub mod trap {
     /// вращение, и проверка на убийство; у `TrapBlock` — тики шипов. Сняв
     /// его, объект замирает целиком.
     pub const UPDATEABLE: usize = 0x45;
-    /// `GoreStick` (u8) — липнет ли к объекту кровь. Чистая косметика.
-    pub const GORE_STICK: usize = 0x46;
     /// `m_Bounding` (4 × i32) — кэш свойства `Bounding`, в пикселях мира.
     ///
     /// Заполняется **лениво**: свойство считает прямоугольник при первом
@@ -368,6 +363,53 @@ pub mod trap_class {
         pub const PROBE_SIZE: usize = 0xB8;
     }
 
+    /// `Bloody_Trapland.WorldObjects.Tracker` — следящая пушка.
+    ///
+    /// Дамп сошёлся с исходником целиком: `LockTimeWait = 1.0` по 0xAC,
+    /// `m_Delay = 0.05` по 0xC0, прямоугольник `collide` `528,624 48x48`
+    /// по 0xD4 и `TextureSize` `15,7 32x35` по 0xEC — тайл и границы спрайта.
+    pub mod tracker {
+        /// `LockTimeWait` (f32) — сколько целится перед выстрелом, 1.0 с.
+        pub const LOCK_TIME_WAIT: usize = 0xAC;
+        /// До конца `TextureSize`.
+        pub const PROBE_SIZE: usize = 0xFC;
+    }
+
+    /// `Bloody_Trapland.WorldObjects.RPlatform` — платформа на рельсах.
+    ///
+    /// В дампе по 0x98 лежало `f=2.000` (значение из `DesignData`), по 0xA8
+    /// и 0xB0 — два одинаковых вектора `(0, -1)`, то есть `Direction` и
+    /// `OldDirection`, а по 0xB8 — `center` размером 8×8, как в коде.
+    pub mod rplatform {
+        /// `Movespeed` (f32) — по умолчанию 1.0, обычно задан уровнем.
+        pub const MOVE_SPEED: usize = 0x98;
+        /// До конца `SimulationPosition`.
+        pub const PROBE_SIZE: usize = 0xD8;
+    }
+
+    /// `Bloody_Trapland.WorldObjects.Threadmill` — движущаяся дорожка.
+    ///
+    /// Дамп: по 0x94 целое `4` (`speed`), по 0x98 единица (`direction`,
+    /// «влево») и по 0x9C вектор `(-4, 0)` — ровно то, что собирает
+    /// `Initialize` из этих двух полей.
+    pub mod threadmill {
+        /// `velocity.X` (f32) — то, что дорожка добавляет игроку.
+        ///
+        /// Крутить надо именно его, а не `speed` (0x94): скорость читается
+        /// один раз в `Initialize`, а игрок каждый кадр берёт `Velocity.X`.
+        pub const VELOCITY_X: usize = 0x9C;
+        /// До конца `velocity`.
+        pub const PROBE_SIZE: usize = 0xA4;
+    }
+
+    /// `Bloody_Trapland.WorldObjects.Fan` — вентилятор.
+    pub mod fan {
+        /// `FanForce` (f32) — по умолчанию 3.0.
+        pub const FAN_FORCE: usize = 0x98;
+        /// До конца `fansize`.
+        pub const PROBE_SIZE: usize = 0xA4;
+    }
+
     /// `Bloody_Trapland.WorldObjects.Trampoline`.
     pub mod trampoline {
         /// `BounceSpeed` (f32) — по умолчанию 9.4; игра подбрасывает на
@@ -375,24 +417,5 @@ pub mod trap_class {
         pub const BOUNCE_SPEED: usize = 0x9C;
         /// До конца `TextureSize`.
         pub const PROBE_SIZE: usize = 0xB4;
-    }
-
-    /// `Bloody_Trapland.WorldObjects.QuickGoal` — переход между уровнями.
-    ///
-    /// Единственный класс, чью раскладку подтвердил ещё и дамп Cheat Engine
-    /// из `re/`: `designWorld`, `designLevel`, `direction` ссылками по
-    /// 0x98…0xA0, `spawnloc` числом по 0xA4, флаги — 0xA8…0xAA.
-    pub mod quick_goal {
-        /// `designWorld` — `System.String`, буква мира (`"a"`…`"f"`).
-        pub const DESIGN_WORLD: usize = 0x98;
-        /// `designLevel` — `System.String`, номер уровня.
-        pub const DESIGN_LEVEL: usize = 0x9C;
-        /// `direction` — `System.String`: `"up"`, `"down"`, …
-        pub const DIRECTION: usize = 0xA0;
-        /// `spawnloc` (i32) — точка появления на новом уровне.
-        pub const SPAWN_LOC: usize = 0xA4;
-        /// `SkipGoal` (u8) — переход отключён самой игрой.
-        pub const SKIP_GOAL: usize = 0xAA;
-        pub const PROBE_SIZE: usize = 0xAB;
     }
 }

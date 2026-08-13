@@ -1,0 +1,64 @@
+# Собирает 32-битную DLL и прикладывает её к релизу.
+#
+# Запускается двумя способами: автоматически при публикации релиза и вручную
+# из вкладки Actions. Ручной запуск нужен, чтобы проверить сборку, не создавая
+# релиза, — артефакт в этом случае просто остаётся в самом прогоне.
+name: release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Только Windows: цель i686-pc-windows-msvc собирается линковщиком MSVC,
+    # а он есть лишь на windows-раннерах.
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установить toolchain
+        # Цель добавляется явно: игра 32-битная, и .cargo/config.toml задаёт
+        # i686-pc-windows-msvc, которого в раннере по умолчанию нет.
+        run: rustup target add i686-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Тесты гоняются до сборки: выкладывать в релиз то, что не проходит
+      # собственные проверки, смысла нет.
+      - name: Тесты
+        run: cargo test --locked
+
+      - name: Сборка
+        run: cargo build --release --locked
+
+      - name: Имя артефакта
+        id: name
+        shell: bash
+        # Версия берётся из Cargo.toml, а не из тега: тег может отсутствовать
+        # при ручном запуске, а версия в манифесте есть всегда.
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "file=btama-v${version}-x86.dll" >> "$GITHUB_OUTPUT"
+
+      - name: Переименовать
+        shell: bash
+        run: |
+          cp target/i686-pc-windows-msvc/release/btama.dll "${{ steps.name.outputs.file }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.file }}
+          path: ${{ steps.name.outputs.file }}
+
+      # Прикладываем к релизу только когда релиз и есть причина запуска.
+      - name: Приложить к релизу
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.name.outputs.file }}

@@ -47,6 +47,7 @@ mod mem;
 mod offsets;
 mod overlay;
 mod scan;
+mod text;
 
 use std::ffi::c_void;
 use std::sync::Once;
