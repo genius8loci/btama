@@ -254,9 +254,10 @@ pub struct CheatOverlay {
     classes: Vec<(usize, usize)>,
 
     settings: HashMap<i32, PlayerConfig>,
-    /// Роли, назначенные пользователем классам ловушек. Отсутствие записи
-    /// означает [`TrapRole::Base`] — читать только общую часть.
-    roles: HashMap<usize, TrapRole>,
+    /// Сведения о встреченных классах: тип из `ObjectType`, пример имени и
+    /// выведенная из типа роль. Растёт по мере появления новых классов и
+    /// живёт до конца сессии — таблицы методов сборщик мусора не двигает.
+    class_info: HashMap<usize, game::ClassInfo>,
 
     keys: Keys,
     view: View,
@@ -294,7 +295,7 @@ impl Default for CheatOverlay {
             traps: Vec::with_capacity(128),
             classes: Vec::with_capacity(16),
             settings: HashMap::new(),
-            roles: HashMap::new(),
+            class_info: HashMap::new(),
             keys: Keys::default(),
             view: View::default(),
             camera: None,
@@ -408,7 +409,8 @@ impl CheatOverlay {
 
         // Ловушки читаются только когда действительно нужны.
         if world.screen != 0 && (self.show_trap_esp || self.show_trap_menu) {
-            self.sim_scale = game::collect_traps(world.screen, &self.roles, &mut self.traps);
+            self.sim_scale =
+                game::collect_traps(world.screen, &mut self.class_info, &mut self.traps);
         } else {
             self.traps.clear();
         }
@@ -565,17 +567,18 @@ impl CheatOverlay {
                     .build();
 
                 // Подпись отвечает на вопрос «что это за пустой квадрат»:
-                // у спавнов, финишей и зон нет спрайта, но имя есть.
-                if self.show_trap_labels {
-                    let name = game::trap_names(item.addr);
-                    let label = name.label();
-                    if !label.is_empty() {
-                        draw_list.add_text(
-                            [top_left[0], top_left[1] - ui.current_font_size()],
-                            color,
-                            label,
-                        );
-                    }
+                // у спавнов, финишей и зон нет спрайта, но тип есть. Берётся
+                // из кэша классов — читать строки каждый кадр на каждый
+                // объект незачем, тип у всего класса один.
+                if self.show_trap_labels
+                    && let Some(info) = self.class_info.get(&item.class)
+                    && !info.label().is_empty()
+                {
+                    draw_list.add_text(
+                        [top_left[0], top_left[1] - ui.current_font_size()],
+                        color,
+                        info.label(),
+                    );
                 }
             }
         }
@@ -977,53 +980,61 @@ impl CheatOverlay {
 
     /// Классы ловушек и пометка «это BoomTrap».
     ///
+    /// Классы, найденные на уровне: тип, пример имени и количество.
+    ///
     /// Раскладка объектов совпадает только до 0x90; дальше у `Trap`,
     /// `BoomTrap`, `QuickGoal` и `SPSpawn` лежат разные поля, а у последних
-    /// двух объект там попросту заканчивается. Автоматически различить классы
-    /// нечем — имена типов в рантайме недоступны, — поэтому роль назначает
-    /// пользователь, и только она открывает чтение за 0x90.
-    fn draw_trap_classes(&mut self, ui: &Ui) {
-        ui.text_colored(MUTED, "Классы (таблица методов x количество и роль):");
+    /// двух объект там попросту заканчивается. Раньше приходилось помечать
+    /// класс вручную, потому что имя типа считалось недоступным. Оно доступно:
+    /// игра сама пишет его в `ObjectType` (0x10) — там лежит `"BoomTrap"`,
+    /// `"Trap"` и так далее. Список стал справочным, выбирать больше нечего.
+    fn draw_trap_classes(&self, ui: &Ui) {
+        ui.text_colored(MUTED, "Классы уровня (ObjectType x количество):");
         for &(class, count) in &self.classes {
-            let _id = ui.push_id(class.to_string());
-            let mut role = self.roles.get(&class).copied().unwrap_or_default();
-            let before = role;
-
-            ui.text_colored(MUTED, format!("0x{class:X} x{count}"));
-            for candidate in [TrapRole::Base, TrapRole::Trap, TrapRole::Boom] {
-                ui.same_line();
-                ui.radio_button(candidate.label(), &mut role, candidate);
-            }
+            let Some(info) = self.class_info.get(&class) else {
+                continue;
+            };
+            let color = match info.role {
+                TrapRole::Base => MUTED,
+                _ => ACCENT,
+            };
+            ui.text_colored(color, format!("{:<12} x{count}", info.label()));
+            ui.same_line();
+            ui.text_colored(MUTED, format!("{}  0x{class:X}", info.sample_name));
             if ui.is_item_hovered() {
-                ui.tooltip_text(
-                    "база — только поля WorldObject (до 0x90), безопасно для любого класса;\n\
-                     Trap — плюс m_Bounding (0xA4) и TextureSize (0x94);\n\
-                     BoomTrap — плюс Speed (0xA4), CanTrigger (0xAC) и координаты движения.\n\n\
-                     Неверная роль даёт неверные числа: у SPSpawn объект кончается на 0x98,\n\
-                     и чтение по 0xA4 попадает уже в соседний объект кучи.",
-                );
-            }
-
-            if role != before {
-                self.roles.insert(class, role);
-                log::info!("класс 0x{class:X}: роль {}", role.label());
+                ui.tooltip_text(format!(
+                    "ObjectType (0x10): {}\nПример имени (0x20): {}\nТаблица методов: 0x{class:X}\n\n\
+                     Читаем поля: {}",
+                    display_or_dash(&info.object_type),
+                    display_or_dash(&info.sample_name),
+                    match info.role {
+                        TrapRole::Base => "только WorldObject, до 0x90",
+                        TrapRole::Trap => "WorldObject + m_Bounding (0xA4), TextureSize (0x94)",
+                        TrapRole::Boom =>
+                            "WorldObject + Speed (0xA4), CanTrigger (0xAC), координаты движения",
+                    },
+                ));
             }
         }
     }
 
     fn draw_trap_row(&mut self, ui: &Ui, index: usize, item: TrapRef) {
         let names = game::trap_names(item.addr);
-        let label = match names.label() {
+        // Слева тип объекта, за ним — имя конкретного ассета. Тип отвечает
+        // на вопрос «что это», имя — «который именно».
+        let kind = match names.object_type.as_str() {
             "" => format!("Trap #{index}"),
-            label => label.to_string(),
+            kind => kind.to_string(),
         };
-        highlighted_label(ui, &format!("{label:<20}"), color_for(item.addr));
+        highlighted_label(ui, &format!("{kind:<12}"), color_for(item.addr));
+        ui.same_line();
+        ui.text_colored(MUTED, format!("{:<20}", names.name));
         if ui.is_item_hovered() {
             ui.tooltip_text(format!(
-                "Name (0x20): {}\nObjectType (0x10): {}\nTextureName (0x0C): {}\nZoneName (0x1C): {}\n\
+                "ObjectType (0x10): {}\nName (0x20): {}\nTextureName (0x0C): {}\nZoneName (0x1C): {}\n\
                  Класс: 0x{:X}\nАдрес: 0x{:X}",
-                display_or_dash(&names.name),
                 display_or_dash(&names.object_type),
+                display_or_dash(&names.name),
                 display_or_dash(&names.texture),
                 display_or_dash(&names.zone),
                 item.class,

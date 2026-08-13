@@ -701,14 +701,12 @@ pub struct TrapRef {
     pub boom: Option<BoomFields>,
 }
 
-/// Роль класса — то, чем пользователь заменяет недоступное имя типа.
+/// Какие поля за 0x90 можно читать у этого класса.
 ///
-/// Дальше 0x90 у разных классов лежат разные поля, а различить их нечем:
-/// в рантайме у нас есть только указатель на таблицу методов. Поэтому по
-/// умолчанию читается лишь общая часть, а всё остальное открывается ролью,
-/// назначенной вручную. Ошибка в роли — это неверные числа на экране, но
-/// не запись мимо цели: писать мы умеем только `Speed` и `CanTrigger`,
-/// и то лишь при роли [`TrapRole::Boom`].
+/// Раскладки классов расходятся после 0x90, и раньше роль приходилось
+/// назначать вручную — казалось, что различить типы нечем. Оказалось, что
+/// игра сама подписывает объект: в `ObjectType` (0x10) лежит строка с именем
+/// класса, `"BoomTrap"` или `"Trap"`. Её и берём.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TrapRole {
     /// Только поля `WorldObject` (до 0x90) — безопасно для любого класса.
@@ -721,11 +719,58 @@ pub enum TrapRole {
 }
 
 impl TrapRole {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Base => "база",
-            Self::Trap => "Trap",
-            Self::Boom => "BoomTrap",
+    /// Выводит роль из строки `ObjectType`.
+    ///
+    /// Хвост после точки берётся на случай, если игра положит туда полное
+    /// имя с пространством имён; регистр не учитывается — обе вольности
+    /// ничего не стоят, а от разночтений страхуют.
+    pub fn from_object_type(object_type: &str) -> Self {
+        let name = object_type
+            .rsplit(['.', '+'])
+            .next()
+            .unwrap_or(object_type)
+            .trim();
+        if name.eq_ignore_ascii_case("BoomTrap") {
+            Self::Boom
+        } else if name.eq_ignore_ascii_case("Trap") {
+            Self::Trap
+        } else {
+            Self::Base
+        }
+    }
+}
+
+/// Что известно о классе объектов из списка ловушек.
+///
+/// Кэшируется по указателю на таблицу методов, и это надёжно: таблицы живут
+/// в загрузочной куче, которую сборщик мусора не двигает, так что указатель
+/// однозначно и навсегда соответствует одному типу. Строки читаются один раз
+/// на класс, а не каждый кадр на каждый объект.
+#[derive(Clone, Debug, Default)]
+pub struct ClassInfo {
+    /// `ObjectType` (0x10) — имя типа, как его хранит сама игра.
+    pub object_type: String,
+    /// `Name` (0x20) первого встреченного объекта этого класса.
+    pub sample_name: String,
+    pub role: TrapRole,
+}
+
+impl ClassInfo {
+    fn read(addr: usize) -> Self {
+        let object_type = read_string_field(addr, trap::OBJECT_TYPE);
+        Self {
+            role: TrapRole::from_object_type(&object_type),
+            sample_name: read_string_field(addr, trap::NAME),
+            object_type,
+        }
+    }
+
+    /// Чем подписывать объект — тип, если игра его назвала, иначе имя ассета.
+    pub fn label(&self) -> &str {
+        if !self.object_type.is_empty() {
+            &self.object_type
+        } else {
+            &self.sample_name
         }
     }
 }
@@ -886,10 +931,10 @@ fn read_boom_fields(addr: usize) -> Option<BoomFields> {
 
 /// Собирает ловушки уровня и возвращает применённый масштаб симуляции.
 ///
-/// `roles` — назначенные пользователем роли классов. Без роли читается
-/// только общая часть `WorldObject` (до 0x90): у `SPSpawn` объект на этом и
-/// заканчивается, у `QuickGoal` — чуть дальше, и чтение прямоугольника по
-/// 0xA4 у них залезло бы в соседний объект кучи. Оттуда охотно возвращается
+/// `classes` — кэш сведений о классах; незнакомые дочитываются на месте.
+/// Роль решает, что можно читать за 0x90: у `SPSpawn` объект заканчивается
+/// на 0x98, у `QuickGoal` — чуть дальше, и чтение прямоугольника по 0xA4 у
+/// них залезло бы в соседний объект кучи. Оттуда охотно возвращается
 /// правдоподобная на вид рамка — так на экране и появлялись пустые квадраты
 /// в воздухе.
 ///
@@ -898,7 +943,7 @@ fn read_boom_fields(addr: usize) -> Option<BoomFields> {
 /// те, что встретились раньше донора.
 pub fn collect_traps(
     screen_addr: usize,
-    roles: &HashMap<usize, TrapRole>,
+    classes: &mut HashMap<usize, ClassInfo>,
     out: &mut Vec<TrapRef>,
 ) -> f32 {
     out.clear();
@@ -913,7 +958,19 @@ pub fn collect_traps(
         let Some(class) = mem::read_ptr(addr + METHOD_TABLE) else {
             continue;
         };
-        let role = roles.get(&class).copied().unwrap_or_default();
+        let role = classes
+            .entry(class)
+            .or_insert_with(|| {
+                let info = ClassInfo::read(addr);
+                crate::log::info!(
+                    "класс 0x{class:X}: ObjectType={:?}, пример {:?} — читаем как {:?}",
+                    info.object_type,
+                    info.sample_name,
+                    info.role
+                );
+                info
+            })
+            .role;
         // Все источники сохраняются сырыми: интерфейс показывает их по
         // галочке «Показать рамки», и по ним видно, откуда взялась рамка.
         out.push(TrapRef {
@@ -958,21 +1015,6 @@ pub struct TrapNames {
     pub texture: String,
     /// `<ZoneName>` (0x1C).
     pub zone: String,
-}
-
-impl TrapNames {
-    /// Что показывать в списке: самое конкретное из прочитанного.
-    pub fn label(&self) -> &str {
-        if !self.name.is_empty() {
-            &self.name
-        } else if !self.object_type.is_empty() {
-            &self.object_type
-        } else if !self.texture.is_empty() {
-            &self.texture
-        } else {
-            ""
-        }
-    }
 }
 
 fn read_string_field(addr: usize, offset: usize) -> String {
@@ -1235,6 +1277,33 @@ mod tests {
             ..blank_trap()
         };
         assert_eq!(world_rect(&item, 100.0), None);
+    }
+
+    /// Строка снята с живой игры: `Traps_SemiMedium2` объявляет себя
+    /// `BoomTrap` — именно это и избавило от ручной разметки классов.
+    #[test]
+    fn role_comes_from_the_object_type_string() {
+        assert_eq!(TrapRole::from_object_type("BoomTrap"), TrapRole::Boom);
+        assert_eq!(TrapRole::from_object_type("Trap"), TrapRole::Trap);
+        assert_eq!(TrapRole::from_object_type("QuickGoal"), TrapRole::Base);
+        assert_eq!(TrapRole::from_object_type("SPSpawn"), TrapRole::Base);
+    }
+
+    /// Пустой или неожиданный тип обязан давать самую осторожную роль:
+    /// чтение за 0x90 у короткого класса уходит в соседний объект кучи.
+    #[test]
+    fn unknown_object_type_stays_on_the_safe_side() {
+        assert_eq!(TrapRole::from_object_type(""), TrapRole::Base);
+        assert_eq!(TrapRole::from_object_type("что-то новое"), TrapRole::Base);
+    }
+
+    #[test]
+    fn role_tolerates_namespaces_and_case() {
+        assert_eq!(
+            TrapRole::from_object_type("Bloody_Trapland.WorldObjects.BoomTrap"),
+            TrapRole::Boom
+        );
+        assert_eq!(TrapRole::from_object_type(" boomtrap "), TrapRole::Boom);
     }
 
     #[test]
