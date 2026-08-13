@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 
 use hudhook::{ImguiRenderLoop, MessageFilter, RenderContext};
-use imgui::{Condition, Context, Drag, ImColor32, Io, StyleColor, Ui, WindowFlags};
+use imgui::{Condition, Context, Drag, ImColor32, Io, MouseButton, StyleColor, Ui, WindowFlags};
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
@@ -117,6 +117,56 @@ impl View {
             (y - self.camera_y) * self.zoom,
         ]
     }
+
+    /// Обратное преобразование — нужно телепорту, который получает точку
+    /// в экранных координатах курсора.
+    fn to_world(self, x: f32, y: f32) -> (f32, f32) {
+        // Ноль отсекаем: ImGui позволяет утащить ползунок масштаба в него,
+        // а деление на ноль отправило бы персонажа в бесконечность.
+        let zoom = if self.zoom.abs() < f32::EPSILON {
+            1.0
+        } else {
+            self.zoom
+        };
+        (x / zoom + self.camera_x, y / zoom + self.camera_y)
+    }
+}
+
+/// Стабильный цвет объекта по его адресу.
+///
+/// Нужен, чтобы одну и ту же ловушку было легко сопоставить между рамкой на
+/// экране и строкой в списке. Биты адреса сначала перемешиваются: без этого
+/// объекты, лежащие рядом в куче, получали бы почти одинаковый оттенок.
+fn color_for(addr: usize) -> [f32; 3] {
+    let mut hash = addr as u32;
+    hash ^= hash >> 16;
+    hash = hash.wrapping_mul(0x7FEB_352D);
+    hash ^= hash >> 15;
+    hash = hash.wrapping_mul(0x846C_A68B);
+    hash ^= hash >> 16;
+
+    hsv_to_rgb((hash % 360) as f32, 0.7, 1.0)
+}
+
+fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> [f32; 3] {
+    let sector = (hue / 60.0).rem_euclid(6.0);
+    let fraction = sector - sector.floor();
+    let p = value * (1.0 - saturation);
+    let q = value * (1.0 - saturation * fraction);
+    let t = value * (1.0 - saturation * (1.0 - fraction));
+
+    match sector as u32 {
+        0 => [value, t, p],
+        1 => [q, value, p],
+        2 => [p, value, t],
+        3 => [p, q, value],
+        4 => [t, p, value],
+        _ => [value, p, q],
+    }
+}
+
+fn rgba(color: [f32; 3], alpha: f32) -> ImColor32 {
+    ImColor32::from_rgba_f32s(color[0], color[1], color[2], alpha)
 }
 
 /// Отслеживание фронтов нажатия: `GetAsyncKeyState` сообщает лишь текущее
@@ -208,6 +258,10 @@ pub struct CheatOverlay {
     show_esp: bool,
     show_trap_esp: bool,
     show_trap_menu: bool,
+    /// Телепорт персонажа правой кнопкой мыши.
+    teleport: bool,
+    /// Показывать сырые значения рамок в списке ловушек.
+    show_trap_rects: bool,
 }
 
 impl Default for CheatOverlay {
@@ -227,6 +281,8 @@ impl Default for CheatOverlay {
             show_esp: true,
             show_trap_esp: true,
             show_trap_menu: false,
+            teleport: false,
+            show_trap_rects: false,
         }
     }
 }
@@ -336,7 +392,31 @@ impl CheatOverlay {
             self.draw_trap_window(ui);
         }
         if self.menu_open {
+            self.handle_teleport(ui, &world);
             draw_cursor(ui);
+        }
+    }
+
+    /// Телепорт персонажа в точку под курсором по правой кнопке.
+    ///
+    /// Работает только при видимом курсоре — то есть пока удерживают `TAB`
+    /// или меню закреплено, — и только когда клик пришёлся мимо окон
+    /// интерфейса: иначе правый клик по ползунку утаскивал бы персонажа.
+    fn handle_teleport(&self, ui: &Ui, world: &World) {
+        if !self.teleport || ui.io().want_capture_mouse {
+            return;
+        }
+        if !ui.is_mouse_clicked(MouseButton::Right) {
+            return;
+        }
+        let Some(local) = world.players.iter().find(|player| player.is_local) else {
+            return;
+        };
+
+        let [x, y] = ui.io().mouse_pos;
+        let (world_x, world_y) = self.view.to_world(x, y);
+        if game::set_position(local.addr, world_x, world_y) {
+            log::info!("телепорт в ({world_x:.0}, {world_y:.0})");
         }
     }
 
@@ -365,12 +445,14 @@ impl CheatOverlay {
         let draw_list = ui.get_background_draw_list();
 
         if self.show_trap_esp {
-            let color = ImColor32::from_rgba(255, 255, 0, 150);
             for item in &self.traps {
                 // Рамка уже проверена на правдоподобность при сборе.
                 let Some(rect) = item.rect else {
                     continue;
                 };
+                // Тот же цвет, что и у фона названия в списке: так видно,
+                // какая рамка какой строке соответствует.
+                let color = rgba(color_for(item.addr), 0.85);
                 let top_left = self.view.to_screen(rect.x as f32, rect.y as f32);
                 let bottom_right = self
                     .view
@@ -480,6 +562,11 @@ impl CheatOverlay {
             ui.checkbox("Ловушки", &mut self.show_trap_menu);
             ui.same_line();
         }
+        ui.checkbox("Teleport", &mut self.teleport);
+        if ui.is_item_hovered() {
+            ui.tooltip_text("ПКМ мимо окон — телепорт персонажа в точку под курсором");
+        }
+        ui.same_line();
         ui.text_colored(MUTED, if self.menu_pinned { "[HOME]" } else { "[TAB]" });
 
         self.draw_diagnostics(ui, world);
@@ -514,10 +601,19 @@ impl CheatOverlay {
             Some(class) => format!("0x{class:X}"),
             None => "не опознан".to_string(),
         };
+        let mode = match game::is_online(world.screen) {
+            Some(true) => "сеть",
+            Some(false) => "одиночная",
+            None => "?",
+        };
+        let camera = match game::camera(world.screen) {
+            Some(addr) => format!("0x{addr:X}"),
+            None => "нет".to_string(),
+        };
         ui.text_colored(
             MUTED,
             format!(
-                "объектов: {} | класс: {class} | экран: 0x{:X} | ловушек: {}",
+                "объектов: {} | класс: {class} | экран: 0x{:X} ({mode}) | камера: {camera} | ловушек: {}",
                 self.objects.len(),
                 world.screen,
                 self.traps.len()
@@ -631,7 +727,26 @@ impl CheatOverlay {
             .build(|| {
                 ui.text_colored(ACCENT, "=== TRAP MANAGER ===");
                 ui.checkbox("Рисовать ESP ловушек", &mut self.show_trap_esp);
+                ui.same_line();
+                ui.checkbox("Показать рамки", &mut self.show_trap_rects);
+                if ui.is_item_hovered() {
+                    ui.tooltip_text(
+                        "Сырые значения m_Rectangle (0x70) и m_Bounding (0x50).\n\
+                         Пока не ясно, какое из полей задаёт положение на экране,\n\
+                         эти числа — то, чего не хватает, чтобы это выяснить.",
+                    );
+                }
                 ui.text(format!("Всего ловушек: {}", self.traps.len()));
+                let with_rect = self.traps.iter().filter(|item| item.rect.is_some()).count();
+                if with_rect != self.traps.len() {
+                    ui.text_colored(
+                        ALERT,
+                        format!(
+                            "Пригодная рамка есть только у {with_rect} из {} — остальные ESP не рисует",
+                            self.traps.len()
+                        ),
+                    );
+                }
                 ui.separator();
 
                 self.draw_trap_classes(ui);
@@ -682,7 +797,7 @@ impl CheatOverlay {
 
     fn draw_trap_row(&mut self, ui: &Ui, index: usize, item: TrapRef) {
         let name = game::trap_name(item.addr).unwrap_or_else(|| format!("Trap #{index}"));
-        ui.text(format!("{name:<20}"));
+        highlighted_label(ui, &format!("{name:<20}"), color_for(item.addr));
         ui.same_line();
 
         flag_checkbox(ui, "U", "Used", item.addr, trap::USED);
@@ -691,32 +806,42 @@ impl CheatOverlay {
         ui.same_line();
         flag_checkbox(ui, "G", "GoreStick", item.addr, trap::GORE_STICK);
 
-        if !self.boom_classes.contains(&item.class) || !game::supports_boom_fields(item.addr) {
-            return;
+        if self.boom_classes.contains(&item.class) && game::supports_boom_fields(item.addr) {
+            ui.same_line();
+            flag_checkbox(
+                ui,
+                "T",
+                "CanTrigger (BoomTrap)",
+                item.addr,
+                trap::BOOM_CAN_TRIGGER,
+            );
+
+            if let Some(mut speed) = game::trap_speed(item.addr) {
+                ui.same_line();
+                ui.set_next_item_width(60.0);
+                if Drag::new("##speed")
+                    .speed(0.1)
+                    .range(0.0, 50.0)
+                    .build(ui, &mut speed)
+                {
+                    game::set_trap_speed(item.addr, speed);
+                }
+                if ui.is_item_hovered() {
+                    ui.tooltip_text("Speed (BoomTrap)");
+                }
+            }
         }
 
-        ui.same_line();
-        flag_checkbox(
-            ui,
-            "T",
-            "CanTrigger (BoomTrap)",
-            item.addr,
-            trap::BOOM_CAN_TRIGGER,
-        );
-
-        if let Some(mut speed) = game::trap_speed(item.addr) {
-            ui.same_line();
-            ui.set_next_item_width(60.0);
-            if Drag::new("##speed")
-                .speed(0.1)
-                .range(0.0, 50.0)
-                .build(ui, &mut speed)
-            {
-                game::set_trap_speed(item.addr, speed);
-            }
-            if ui.is_item_hovered() {
-                ui.tooltip_text("Speed (BoomTrap)");
-            }
+        // Отдельной строкой в конце, чтобы не ломать выкладку кнопок выше.
+        if self.show_trap_rects {
+            ui.text_colored(
+                MUTED,
+                format!(
+                    "    0x70 {} | 0x50 {}",
+                    format_rect(item.rectangle_raw),
+                    format_rect(item.bounding_raw)
+                ),
+            );
         }
     }
 }
@@ -724,6 +849,35 @@ impl CheatOverlay {
 // ============================================================================
 // МЕЛКИЕ ЭЛЕМЕНТЫ
 // ============================================================================
+
+/// Текст на цветной подложке.
+///
+/// Подложка приглушена до трети непрозрачности: сам текст должен оставаться
+/// читаемым, а цвет нужен лишь как метка, связывающая строку с рамкой на
+/// экране.
+fn highlighted_label(ui: &Ui, text: &str, color: [f32; 3]) {
+    const PADDING: f32 = 3.0;
+
+    let position = ui.cursor_screen_pos();
+    let size = ui.calc_text_size(text);
+    ui.get_window_draw_list()
+        .add_rect(
+            [position[0] - PADDING, position[1]],
+            [position[0] + size[0] + PADDING, position[1] + size[1]],
+            rgba(color, 0.35),
+        )
+        .filled(true)
+        .build();
+    ui.text(text);
+}
+
+/// Форматирует рамку для диагностики.
+fn format_rect(rect: Option<game::Rect>) -> String {
+    match rect {
+        Some(rect) => format!("{},{} {}x{}", rect.x, rect.y, rect.w, rect.h),
+        None => "-".to_string(),
+    }
+}
 
 /// Чекбокс поверх байтового поля в памяти игры.
 ///
@@ -784,4 +938,70 @@ fn draw_cursor(ui: &Ui) {
         .add_line([x, y - size], [x, y + size], color)
         .thickness(1.5)
         .build();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn world_to_screen_round_trips() {
+        let view = View {
+            zoom: 0.833,
+            camera_x: 120.0,
+            camera_y: -45.0,
+        };
+        let [screen_x, screen_y] = view.to_screen(234.0, 588.0);
+        let (world_x, world_y) = view.to_world(screen_x, screen_y);
+        assert!((world_x - 234.0).abs() < 0.01, "получили {world_x}");
+        assert!((world_y - 588.0).abs() < 0.01, "получили {world_y}");
+    }
+
+    #[test]
+    fn zero_zoom_does_not_produce_infinity() {
+        // Ползунок масштаба доходит до нуля, а телепорт делит на него.
+        let view = View {
+            zoom: 0.0,
+            camera_x: 0.0,
+            camera_y: 0.0,
+        };
+        let (x, y) = view.to_world(100.0, 200.0);
+        assert!(x.is_finite() && y.is_finite());
+    }
+
+    #[test]
+    fn trap_color_is_stable_for_the_same_address() {
+        assert_eq!(color_for(0x23CA_4A10), color_for(0x23CA_4A10));
+    }
+
+    #[test]
+    fn neighbouring_addresses_get_distinguishable_colors() {
+        // Объекты в куче лежат вплотную; без перемешивания битов их оттенки
+        // были бы неразличимы.
+        let first = color_for(0x0400_0000);
+        let second = color_for(0x0400_0010);
+        let distance: f32 = (0..3).map(|i| (first[i] - second[i]).abs()).sum();
+        assert!(
+            distance > 0.2,
+            "цвета слишком близки: {first:?} и {second:?}"
+        );
+    }
+
+    #[test]
+    fn hsv_covers_the_primaries() {
+        assert_eq!(hsv_to_rgb(0.0, 1.0, 1.0), [1.0, 0.0, 0.0]);
+        assert_eq!(hsv_to_rgb(120.0, 1.0, 1.0), [0.0, 1.0, 0.0]);
+        assert_eq!(hsv_to_rgb(240.0, 1.0, 1.0), [0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn hsv_channels_stay_in_range_across_the_wheel() {
+        for hue in 0..720 {
+            let rgb = hsv_to_rgb(hue as f32, 0.7, 1.0);
+            assert!(
+                rgb.iter().all(|channel| (0.0..=1.0).contains(channel)),
+                "оттенок {hue} дал {rgb:?}"
+            );
+        }
+    }
 }

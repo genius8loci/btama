@@ -23,8 +23,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::mem;
 use crate::offsets::{METHOD_TABLE, MIN_VALID_ADDRESS, PTR_SIZE, list, player, screen, trap};
 
-/// Верхняя граница разумного размера рамки в игровых единицах.
+/// Верхняя граница разумного размера рамки игрока в игровых единицах.
 const MAX_DIMENSION: i32 = 2000;
+
+/// Для ловушек предел заметно выше: элементы уровня бывают куда крупнее
+/// персонажа, а общий предел в 2000 мог отбраковывать их целиком — что
+/// выглядело бы как «ESP ловушек не рисуется».
+const MAX_TRAP_DIMENSION: i32 = 10_000;
 
 /// Больше игроков в сессии не бывает; значение сверх этого означает, что мы
 /// читаем не список игроков.
@@ -66,7 +71,12 @@ impl Rect {
     /// `x != 0 && y != 0` и потому не рисовала объекты, стоящие на нулевой
     /// координате.
     pub fn is_plausible(&self) -> bool {
-        self.w > 0 && self.h > 0 && self.w <= MAX_DIMENSION && self.h <= MAX_DIMENSION
+        self.is_plausible_within(MAX_DIMENSION)
+    }
+
+    /// То же, но с собственным пределом размера.
+    pub fn is_plausible_within(&self, max_dimension: i32) -> bool {
+        self.w > 0 && self.h > 0 && self.w <= max_dimension && self.h <= max_dimension
     }
 }
 
@@ -150,8 +160,15 @@ fn is_player(addr: usize) -> bool {
     mem::is_readable(addr, player::PROBE_SIZE) && mem::read_ptr(addr + METHOD_TABLE) == Some(class)
 }
 
+/// Наш ли это персонаж.
+///
+/// Двух признаков недостаточно поодиночке: в сетевой игре наш игрок помечен
+/// `isLocal == 1`, но в одиночной сеть не участвует и флаг остаётся нулём.
+/// `RemotePlayer` же равен нулю у нашего персонажа в обоих режимах и единице
+/// у чужого, так что вместе они дают верный ответ во всех трёх случаях.
 fn is_local(addr: usize) -> bool {
     mem::read::<u8>(addr + player::IS_LOCAL) == Some(1)
+        || mem::read::<u8>(addr + player::REMOTE_PLAYER) == Some(0)
 }
 
 /// Признаки игрока, проверяемые не выходя за пределы самого объекта.
@@ -182,14 +199,48 @@ fn looks_like_player(addr: usize) -> bool {
     Rect::read(addr + player::BOUNDING_RECT).is_some_and(|rect| rect.is_plausible())
 }
 
+/// Все известные списки игроков экрана, объединённые и без дубликатов.
+///
+/// Списков три, потому что в разных режимах заполнены разные: в одиночной
+/// игре — `PlayerList`, в сетевой к нему добавляются `RemotePlayerList` и
+/// `MergedPlayerList`. Все три принадлежат базовому классу экрана, так что
+/// читать их безопасно в любом режиме — незаполненный просто даст пусто.
+fn player_lists(screen_addr: usize) -> Vec<usize> {
+    const LISTS: [usize; 3] = [
+        screen::PLAYER_LIST,
+        screen::REMOTE_PLAYER_LIST,
+        screen::MERGED_PLAYER_LIST,
+    ];
+
+    let mut addresses = Vec::new();
+    for offset in LISTS {
+        if let Some(list_addr) = mem::read_ptr(screen_addr + offset) {
+            addresses.extend(read_list(list_addr, MAX_PLAYERS));
+        }
+    }
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses
+}
+
 /// Определяет таблицу методов класса `Player`.
 ///
-/// Эталон берётся с объекта, объявившего себя локальным игроком: такой в
-/// сессии ровно один, а остальные проверки в [`looks_like_player`] отсеивают
-/// случайный мусор, у которого байт по 0x152 тоже оказался нулём или единицей.
+/// Признак самопроверяющийся: кандидат обязан найти сам себя в списке игроков
+/// своего же `GameplayScreen`. Случайный мусор такую замкнутую ссылку не даст.
+///
+/// Списки читаются по смещениям **базового** класса экрана, поэтому проверка
+/// работает и в одиночной игре, и в сетевой. Требования «объект объявил себя
+/// локальным» здесь намеренно нет: в одиночной игре `isLocal` остаётся нулём,
+/// и именно на этом опознание класса раньше и застревало.
 fn bootstrap(objects: &[usize]) {
     for &addr in objects {
-        if !looks_like_player(addr) || !is_local(addr) {
+        if !looks_like_player(addr) {
+            continue;
+        }
+        let Some(screen_addr) = mem::read_ptr(addr + player::GAMEPLAY_SCREEN) else {
+            continue;
+        };
+        if !player_lists(screen_addr).contains(&addr) {
             continue;
         }
         let Some(class) = mem::read_ptr(addr + METHOD_TABLE) else {
@@ -298,16 +349,34 @@ pub fn build_world(objects: &[usize]) -> World {
     world
 }
 
-/// Читает список игроков из `GameplayScreen`. Пустой результат означает, что
-/// смещение для этого режима игры не подходит.
+/// Читает игроков из списков экрана.
 fn players_from_screen(screen_addr: usize) -> Vec<PlayerView> {
     if screen_addr == 0 {
         return Vec::new();
     }
-    let Some(list_addr) = mem::read_ptr(screen_addr + screen::PLAYERS) else {
-        return Vec::new();
-    };
-    collect_players(&read_list(list_addr, MAX_PLAYERS))
+    collect_players(&player_lists(screen_addr))
+}
+
+/// Сетевая ли сессия — по флагу `m_Online` экрана.
+pub fn is_online(screen_addr: usize) -> Option<bool> {
+    if screen_addr == 0 {
+        return None;
+    }
+    mem::read::<u8>(screen_addr + screen::IS_ONLINE).map(|value| value != 0)
+}
+
+/// Указатель на объект камеры. Пока используется только для диагностики:
+/// раскладка самой камеры не снята.
+pub fn camera(screen_addr: usize) -> Option<usize> {
+    if screen_addr == 0 {
+        return None;
+    }
+    mem::read_ptr(screen_addr + screen::CAMERA).filter(|&addr| addr >= MIN_VALID_ADDRESS)
+}
+
+/// Телепортирует персонажа, записывая `m_Position`.
+pub fn set_position(addr: usize, x: f32, y: f32) -> bool {
+    mem::write::<[f32; 2]>(addr + player::POSITION, [x, y])
 }
 
 // ============================================================================
@@ -372,7 +441,12 @@ pub struct TrapRef {
     pub addr: usize,
     /// Таблица методов — идентификатор конкретного класса ловушки.
     pub class: usize,
+    /// Рамка, выбранная для ESP: первая правдоподобная из двух ниже.
     pub rect: Option<Rect>,
+    /// `m_Rectangle` (0x70) как есть, без отбраковки.
+    pub rectangle_raw: Option<Rect>,
+    /// `m_Bounding` (0x50) как есть, без отбраковки.
+    pub bounding_raw: Option<Rect>,
 }
 
 /// Собирает ловушки уровня.
@@ -389,15 +463,21 @@ pub fn collect_traps(screen_addr: usize, out: &mut Vec<TrapRef>) {
         let Some(class) = mem::read_ptr(addr + METHOD_TABLE) else {
             continue;
         };
+        // Обе рамки сохраняются сырыми: ESP ловушек пока не выравнивается, и
+        // без исходных чисел не понять, какое из полей задаёт положение на
+        // экране. Интерфейс показывает их в строке ловушки.
+        let rectangle_raw = Rect::read(addr + trap::RECTANGLE);
+        let bounding_raw = Rect::read(addr + trap::BOUNDING);
         out.push(TrapRef {
             addr,
             class,
-            // `m_Rectangle` — то, чем пользовалась последняя версия с
-            // работающим ESP ловушек; `m_Bounding` остаётся запасным.
-            // Оба поля лежат по одному адресу и у `Trap`, и у наследников.
-            rect: Rect::read(addr + trap::RECTANGLE)
-                .filter(Rect::is_plausible)
-                .or_else(|| Rect::read(addr + trap::BOUNDING).filter(Rect::is_plausible)),
+            rect: rectangle_raw
+                .filter(|rect| rect.is_plausible_within(MAX_TRAP_DIMENSION))
+                .or_else(|| {
+                    bounding_raw.filter(|rect| rect.is_plausible_within(MAX_TRAP_DIMENSION))
+                }),
+            rectangle_raw,
+            bounding_raw,
         });
     }
 }
@@ -466,6 +546,20 @@ mod tests {
             h: 32,
         };
         assert!(rect.is_plausible());
+    }
+
+    #[test]
+    fn trap_limit_admits_rects_the_player_limit_rejects() {
+        // Крупный элемент уровня: по игроцкому пределу отбраковывается,
+        // по ловушечному — проходит.
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 4096,
+            h: 64,
+        };
+        assert!(!rect.is_plausible());
+        assert!(rect.is_plausible_within(MAX_TRAP_DIMENSION));
     }
 
     #[test]

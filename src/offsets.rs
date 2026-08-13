@@ -42,7 +42,7 @@ pub mod player {
     /// а не адрес объекта, служит ключом пользовательских настроек: адрес
     /// меняется при каждой компактящей сборке мусора.
     pub const UNIQUE_ID: usize = 0x04;
-    /// `m_Position` (2 × f32).
+    /// `m_Position` (2 × f32). Запись сюда телепортирует персонажа.
     pub const POSITION: usize = 0x0C;
     /// `m_Color` (u32) — упакованный XNA-цвет в порядке RGBA.
     pub const COLOR: usize = 0x38;
@@ -50,6 +50,12 @@ pub mod player {
     pub const BOUNDING_RECT: usize = 0x3C;
     /// `m_Name` — указатель на `System.String`.
     pub const NAME: usize = 0x54;
+    /// `RemotePlayer` (u8) — управляется ли игрок по сети.
+    ///
+    /// Нужен вдобавок к [`IS_LOCAL`]: в одиночной игре сеть не участвует и
+    /// `isLocal` остаётся нулём даже у нашего собственного персонажа, тогда
+    /// как `RemotePlayer` равен нулю в обоих режимах.
+    pub const REMOTE_PLAYER: usize = 0x6D;
     /// `GameplayScreen` — указатель на экран, через который доступны
     /// списки игроков и ловушек.
     pub const GAMEPLAY_SCREEN: usize = 0xAC;
@@ -78,20 +84,36 @@ pub mod player {
     pub const PROBE_SIZE: usize = IS_LOCAL + 1;
 }
 
-/// `Bloody_Trapland.Screens.OnlineGameplayScreen`.
+/// `Bloody_Trapland.Screens.GameplayScreen` — базовый класс экрана.
 ///
-/// # Осторожно
+/// В одиночной игре экран имеет именно этот тип, в сетевой — производный
+/// `OnlineGameplayScreen`. Все смещения ниже принадлежат базовому классу и
+/// потому верны в обоих режимах.
 ///
-/// Дампы в `re/` сняты с **онлайновой** сессии. В одиночной игре класс экрана
-/// другой, и эти смещения могут не значить ничего. Поэтому оба списка ниже —
-/// не более чем подсказка: результат обязательно проверяется, а при неудаче
-/// код обходится буфером хука. Общего `PROBE_SIZE` для экрана намеренно нет —
-/// требовать читаемости всех 0x104 байт нельзя, экран может быть короче.
+/// Ровно на этом раньше всё и ломалось: код искал игроков по `m_Players`
+/// (0x100), а это поле есть **только** у производного онлайнового класса.
+/// В одиночной игре по 0x100 лежит что угодно, список не читался, класс
+/// `Player` не опознавался — и разом отказывали и список игроков, и ESP.
+///
+/// Общего `PROBE_SIZE` для экрана намеренно нет: требовать читаемости всей
+/// структуры целиком нельзя, длина у двух классов разная.
 pub mod screen {
     /// `TrapList` — `List<Trap>`.
     pub const TRAP_LIST: usize = 0x34;
-    /// `m_Players` — `List<Player>`.
-    pub const PLAYERS: usize = 0x100;
+    /// `PlayerList` — `List<Player>`, локальные игроки.
+    pub const PLAYER_LIST: usize = 0x3C;
+    /// `RemotePlayerList` — `List<Player>`, сетевые игроки.
+    pub const REMOTE_PLAYER_LIST: usize = 0x40;
+    /// `MergedPlayerList` — `List<Player>`, объединение двух предыдущих.
+    pub const MERGED_PLAYER_LIST: usize = 0x44;
+    /// `camera` — указатель на объект камеры.
+    ///
+    /// Раскладка самого объекта пока не снята, поэтому перевод мировых
+    /// координат в экранные до сих пор делается вручную ползунками. Как
+    /// только появится дамп — подставлять смещения нужно сюда.
+    pub const CAMERA: usize = 0x4C;
+    /// `m_Online` (u8) — сетевая ли сессия.
+    pub const IS_ONLINE: usize = 0xD1;
 }
 
 /// `Bloody_Trapland.WorldObjects.Trap` и его наследники.
