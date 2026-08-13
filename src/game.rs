@@ -749,6 +749,12 @@ pub struct TrapRef {
     pub position: Option<(f32, f32)>,
     /// `Position` (0x88) — позиция в единицах симуляции.
     pub position_alt: Option<(f32, f32)>,
+    /// `Scale` (0x2C) — множитель размера.
+    pub scale: Option<f32>,
+    /// `Rotation` (0x30) — поворот в радианах.
+    pub rotation: Option<f32>,
+    /// Что игра говорит о типе этого объекта.
+    pub role: TrapRole,
     /// Поля класса `Trap`; `None`, если роль класса не назначена.
     pub trap: Option<TrapFields>,
     /// Поля класса `BoomTrap`; `None`, если роль класса не назначена.
@@ -770,6 +776,8 @@ pub enum TrapRole {
     Trap,
     /// `Bloody_Trapland.WorldObjects.BoomTrap`.
     Boom,
+    /// `Bloody_Trapland.WorldObjects.Spinner` — шип на вращающейся руке.
+    Spinner,
 }
 
 impl TrapRole {
@@ -788,6 +796,8 @@ impl TrapRole {
             Self::Boom
         } else if name.eq_ignore_ascii_case("Trap") {
             Self::Trap
+        } else if name.eq_ignore_ascii_case("Spinner") {
+            Self::Spinner
         } else {
             Self::Base
         }
@@ -921,28 +931,26 @@ fn derive_sim_scale(traps: &[TrapRef]) -> f32 {
 ///
 /// Порядок именно такой, потому что источники неравноценны:
 ///
-/// 1. `m_Bounding` (0x50) — готовый прямоугольник коллизии прямо в пикселях
-///    мира. Точнее всех, но заполнен только у элементов уровня; у собственно
-///    ловушек остаётся нулевым;
+/// 1. `m_Bounding` (0x50) — кэш свойства `Bounding`. Если игра его уже
+///    посчитала, берём как есть: это ровно то, чем она сама пользуется;
 /// 2. `Trap.m_Bounding` (0xA4) — такой же прямоугольник, но объявленный уже
 ///    самой ловушкой. Только при роли [`TrapRole::Trap`]: у остальных классов
 ///    по этому адресу либо другое поле, либо вообще конец объекта;
-/// 3. `Position` (0x88), переведённая из единиц симуляции, плюс размер кадра
-///    (0x70). Размер кадра совпадает с размером объекта в мире — тайлы 48×48
-///    и 48×96 это подтверждают;
-/// 4. `PositionX`/`PositionY` (0x24) с тем же размером. В снятой сборке эта
-///    пара везде нулевая, но она есть в раскладке и ничего не стоит.
+/// 3. та же формула, что и у самой игры, — [`world_rect_from_parts`].
 ///
 /// Обратите внимание, чего в списке нет: самого `m_Rectangle` как рамки.
 /// Прежняя версия ставила его первым, а это координаты в атласе текстур —
 /// отсюда и рамки кучей в углу экрана вместо ESP.
-///
-/// Нулевую позицию мы пропускаем. Объект ровно в начале координат из-за
-/// этого рамку потеряет, но такой объект и так несёт `m_Bounding` и будет
-/// пойман первым правилом, а вот незаполненное поле нулём притворяется
-/// постоянно — и именно оно собирало рамки в левом верхнем углу.
 fn world_rect(item: &TrapRef, sim_scale: f32) -> Option<RectF> {
     let plausible = |rect: &Rect| rect.is_plausible_within(MAX_TRAP_DIMENSION);
+
+    // У шипа на руке своя зона поражения, и она не имеет ничего общего с
+    // рамкой самого объекта: та стоит на оси вращения.
+    if item.role == TrapRole::Spinner
+        && let Some(rect) = spinner_rect(item, sim_scale)
+    {
+        return Some(rect);
+    }
 
     if let Some(rect) = item
         .bounding_raw
@@ -951,18 +959,83 @@ fn world_rect(item: &TrapRef, sim_scale: f32) -> Option<RectF> {
     {
         return Some(rect.into());
     }
+    world_rect_from_parts(item, sim_scale)
+}
 
-    let size = item.source_raw.filter(plausible)?;
+/// Зона поражения `Spinner`, посчитанная его же формулой.
+///
+/// Прямоугольник лежит в приватном `CollisionRect`, смещения которого мы не
+/// знаем, — но оно и не нужно: игра пересчитывает его каждый кадр из полей,
+/// которые у нас уже есть.
+///
+/// ```csharp
+/// CollisionRect.X = ToDisplayUnits(Position.X) - 16 + sin(-Rotation) * (DrawRectangle.Height - 30);
+/// CollisionRect.Y = ToDisplayUnits(Position.Y) - 16 + cos( Rotation) * (DrawRectangle.Height - 30);
+/// // размер всегда 24x24
+/// ```
+///
+/// Рамка объекта у `Spinner` стоит на оси вращения и убивает не она:
+/// свойство `Bounding` перекрыто и возвращает как раз `CollisionRect`.
+/// Поэтому ESP должен показывать именно эту точку на конце руки.
+fn spinner_rect(item: &TrapRef, sim_scale: f32) -> Option<RectF> {
+    /// Сторона зоны поражения — в коде игры зашита числом.
+    const SIZE: f32 = 24.0;
+    /// Половина стороны: игра сдвигает угол на неё, центрируя зону.
+    const HALF: f32 = 16.0;
+    /// На столько рука короче кадра — шип утоплен к центру.
+    const ARM_INSET: f32 = 30.0;
+
+    let (sim_x, sim_y) = item.position_alt?;
+    let rotation = item.rotation.filter(|value| value.is_finite())?;
+    let arm = item.source_raw?.h as f32 - ARM_INSET;
+
+    Some(RectF {
+        x: sim_x * sim_scale - HALF + (-rotation).sin() * arm,
+        y: sim_y * sim_scale - HALF + rotation.cos() * arm,
+        w: SIZE,
+        h: SIZE,
+    })
+}
+
+/// Считает рамку так же, как это делает свойство `WorldObject.Bounding`.
+///
+/// ```csharp
+/// m_Bounding = new Rectangle(
+///     round(ConvertUnits.ToDisplayUnits(Position.X)),
+///     round(ConvertUnits.ToDisplayUnits(Position.Y)),
+///     round(DrawRectangle.Width  * Scale),
+///     round(DrawRectangle.Height * Scale));
+/// ```
+///
+/// Свойство считает это лениво и запоминает, поэтому у объектов, к рамке
+/// которых игра ещё не обращалась, поле 0x50 пустует — а нам рисовать надо
+/// уже сейчас. Раньше это выглядело как «запасной путь на всякий случай»;
+/// на деле это тот же самый расчёт, просто выполненный нами.
+///
+/// Нулевую позицию пропускаем: объект ровно в начале координат из-за этого
+/// рамку потеряет, но такой объект и так несёт заполненный `m_Bounding` и
+/// будет пойман раньше, а вот незаполненное поле нулём притворяется
+/// постоянно — и именно оно собирало рамки в левом верхнем углу.
+fn world_rect_from_parts(item: &TrapRef, sim_scale: f32) -> Option<RectF> {
+    let frame = item
+        .source_raw
+        .filter(|rect| rect.is_plausible_within(MAX_TRAP_DIMENSION))?;
     let non_zero = |&(x, y): &(f32, f32)| x != 0.0 || y != 0.0;
     let (x, y) = match item.position_alt.filter(non_zero) {
         Some((sim_x, sim_y)) => (sim_x * sim_scale, sim_y * sim_scale),
         None => item.position.filter(non_zero)?,
     };
+    // Масштаб бывает нулевым у объектов, которые ещё не прошли загрузку;
+    // единица в этом случае честнее, чем схлопнутая в точку рамка.
+    let scale = item
+        .scale
+        .filter(|scale| scale.is_finite() && *scale > 0.0)
+        .unwrap_or(1.0);
     Some(RectF {
         x,
         y,
-        w: size.w as f32,
-        h: size.h as f32,
+        w: frame.w as f32 * scale,
+        h: frame.h as f32 * scale,
     })
 }
 
@@ -1041,6 +1114,9 @@ pub fn collect_traps(
             source_raw: Rect::read(addr + trap::SOURCE_RECT),
             position: read_vector2(addr + trap::POSITION_X),
             position_alt: read_vector2(addr + trap::POSITION),
+            scale: mem::read::<f32>(addr + trap::SCALE),
+            rotation: mem::read::<f32>(addr + trap::ROTATION),
+            role,
             trap: (role == TrapRole::Trap)
                 .then(|| read_trap_fields(addr))
                 .flatten(),
@@ -1144,6 +1220,9 @@ mod tests {
             source_raw: None,
             position: Some((0.0, 0.0)),
             position_alt: Some((0.0, 0.0)),
+            scale: Some(1.0),
+            rotation: Some(0.0),
+            role: TrapRole::Base,
             trap: None,
             boom: None,
         }
@@ -1271,6 +1350,44 @@ mod tests {
         assert_eq!((rect.w, rect.h), (48.0, 96.0));
     }
 
+    /// Размер объекта — это размер кадра, умноженный на `Scale`; так его
+    /// считает само свойство `WorldObject.Bounding`.
+    #[test]
+    fn frame_size_is_multiplied_by_scale() {
+        let item = TrapRef {
+            source_raw: Some(Rect {
+                x: 96,
+                y: 0,
+                w: 48,
+                h: 48,
+            }),
+            position_alt: Some((1.44, 5.76)),
+            scale: Some(2.0),
+            ..blank_trap()
+        };
+        let rect = world_rect(&item, 100.0).expect("рамка должна собраться");
+        assert_eq!((rect.w, rect.h), (96.0, 96.0));
+    }
+
+    /// Нулевой масштаб встречается у объектов, не прошедших загрузку;
+    /// схлопывать их рамку в точку — худший из возможных исходов.
+    #[test]
+    fn zero_scale_falls_back_to_one() {
+        let item = TrapRef {
+            source_raw: Some(Rect {
+                x: 0,
+                y: 0,
+                w: 48,
+                h: 48,
+            }),
+            position_alt: Some((1.0, 1.0)),
+            scale: Some(0.0),
+            ..blank_trap()
+        };
+        let rect = world_rect(&item, 100.0).expect("рамка должна собраться");
+        assert_eq!((rect.w, rect.h), (48.0, 48.0));
+    }
+
     #[test]
     fn zero_simulation_position_defers_to_the_pixel_one() {
         let source = Rect {
@@ -1321,6 +1438,42 @@ mod tests {
     fn unknown_object_type_stays_on_the_safe_side() {
         assert_eq!(TrapRole::from_object_type(""), TrapRole::Base);
         assert_eq!(TrapRole::from_object_type("что-то новое"), TrapRole::Base);
+    }
+
+    /// Шип на руке ездит по окружности вокруг оси: при повороте 0 он строго
+    /// под осью, при половине оборота — строго над ней. Рамка самого объекта
+    /// при этом стоит на месте и к делу отношения не имеет.
+    #[test]
+    fn spinner_zone_orbits_the_pivot() {
+        let item = TrapRef {
+            // Ось в (1000, 500) пикселей мира.
+            position_alt: Some((10.0, 5.0)),
+            source_raw: Some(Rect {
+                x: 0,
+                y: 0,
+                w: 48,
+                h: 130,
+            }),
+            role: TrapRole::Spinner,
+            rotation: Some(0.0),
+            ..blank_trap()
+        };
+
+        // Длина руки — высота кадра минус утопленная часть: 130 - 30 = 100.
+        let down = world_rect(&item, 100.0).expect("зона должна считаться");
+        assert!((down.x - (1000.0 - 16.0)).abs() < 0.01, "{}", down.x);
+        assert!((down.y - (500.0 - 16.0 + 100.0)).abs() < 0.01, "{}", down.y);
+        assert_eq!((down.w, down.h), (24.0, 24.0));
+
+        let up = world_rect(
+            &TrapRef {
+                rotation: Some(std::f32::consts::PI),
+                ..item
+            },
+            100.0,
+        )
+        .expect("зона должна считаться");
+        assert!((up.y - (500.0 - 16.0 - 100.0)).abs() < 0.01, "{}", up.y);
     }
 
     #[test]

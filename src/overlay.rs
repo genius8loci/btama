@@ -1087,6 +1087,8 @@ ZoneName (0x1C): {}
                     TrapRole::Trap => "WorldObject + m_Bounding (0xA4), TextureSize (0x94)",
                     TrapRole::Boom =>
                         "WorldObject + Speed (0xA4), CanTrigger (0xAC), координаты движения",
+                    TrapRole::Spinner =>
+                        "WorldObject; зона поражения считается из позиции и поворота",
                 },
                 group.members.len(),
             ));
@@ -1142,11 +1144,12 @@ ZoneName (0x1C): {}
         ui.text_colored(
             MUTED,
             format!(
-                "    поз {} | 0x50 {} | 0x70 {} | 0x88 {}",
-                format_point(item.position),
+                "    0x50 {} | 0x70 кадр {} | 0x88 симуляция {} | масштаб {} | поворот {}",
                 format_rect(item.bounding_raw),
                 format_rect(item.source_raw),
                 format_point(item.position_alt),
+                format_scalar(item.scale),
+                format_scalar(item.rotation),
             ),
         );
         if let Some(fields) = item.trap {
@@ -1349,6 +1352,14 @@ fn draw_raw_fields(ui: &Ui, addr: usize) {
                 raw as i32
             ),
         );
+    }
+}
+
+/// Форматирует одиночное число для диагностики.
+fn format_scalar(value: Option<f32>) -> String {
+    match value {
+        Some(value) => format!("{value:.2}"),
+        None => "-".to_string(),
     }
 }
 
